@@ -1,9 +1,9 @@
-/* Nibble service worker: cache the app shell so it works offline.
+/* TrackFood service worker: cache the app shell so it works offline.
    Bump CACHE_VERSION whenever any shell file changes, so installed
    phones pick up the new version. */
 'use strict';
 
-const CACHE_VERSION = 'nibble-v1';
+const CACHE_VERSION = 'trackfood-v2';
 const SHELL = [
   './',
   './index.html',

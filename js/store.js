@@ -1,7 +1,7 @@
-/* ===== Nibble: storage + state + math ===== */
+/* ===== TrackFood: storage + state + math ===== */
 'use strict';
 
-const DB_NAME = 'nibble';
+const DB_NAME = 'nibble'; /* kept from v1 so existing installs keep their data after the rename */
 const DB_VER = 1;
 let _db = null;
 
@@ -50,6 +50,28 @@ function todayStr(d) {
 }
 function uid(prefix) { return (prefix||'') + Date.now().toString(36) + Math.random().toString(36).slice(2,7); }
 
+/* Bring a food up to the current shape:
+   - cats: array (was cat: string); built-ins get recategorised via CAT_REMAP
+   - promptAdd: per-food sauce/topping follow-up groups (default none)
+   - drinks get a 200 ml serving as the default portion */
+function canonicalizeFood(f) {
+  if (!Array.isArray(f.cats)) {
+    const remap = CAT_REMAP[(f.name || '').toLowerCase()];
+    f.cats = remap ? remap.slice() : [f.cat || 'misc'];
+    delete f.cat;
+  }
+  if (!Array.isArray(f.promptAdd)) f.promptAdd = [];
+  if (f.cats.includes('drinks')) {
+    f.per = f.per || 'ml';
+    const has200 = (f.servings || []).some(s => s.grams === 200);
+    if (!has200) {
+      f.servings = f.servings || [];
+      f.servings.unshift({ name: '1 glass', grams: 200 });
+    }
+  }
+  return f;
+}
+
 /* ---------- bootstrap ---------- */
 async function initStore() {
   await openDB();
@@ -60,8 +82,16 @@ async function initStore() {
 
   /* First run: seed foods + create a default user */
   if (State.foods.length === 0) {
-    for (const f of SEED_FOODS) await dbPut('foods', f);
+    for (const f of SEED_FOODS) await dbPut('foods', canonicalizeFood(f));
     State.foods = await dbGetAll('foods');
+  } else {
+    /* upgrade existing installs in place (cat -> cats, new fields) */
+    for (const f of State.foods) {
+      if (!Array.isArray(f.cats) || !Array.isArray(f.promptAdd)) {
+        canonicalizeFood(f);
+        await dbPut('foods', f);
+      }
+    }
   }
   if (State.users.length === 0) {
     const u = newUser('Me');
@@ -72,6 +102,8 @@ async function initStore() {
   State.currentUserId = State.meta.currentUserId && State.users.some(u=>u.id===State.meta.currentUserId)
     ? State.meta.currentUserId : State.users[0].id;
   if (!State.meta.backupTimes) State.meta.backupTimes = ['06:00', '20:00'];
+  if (!Array.isArray(State.meta.disabledCats)) State.meta.disabledCats = [];
+  if (!Array.isArray(State.meta.customCats)) State.meta.customCats = [];
 }
 
 function reindexFoods() {
@@ -224,14 +256,14 @@ async function exportData() {
   const users = State.users;
   const entries = await dbGetAll('entries');
   const meta = State.meta;
-  return { app: 'nibble', version: 1, exportedAt: new Date().toISOString(), foods, users, entries, meta };
+  return { app: 'trackfood', version: 2, exportedAt: new Date().toISOString(), foods, users, entries, meta };
 }
 function downloadBackup(obj) {
   const blob = new Blob([JSON.stringify(obj)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = 'nibble-backup-' + todayStr() + '.json';
+  a.download = 'trackfood-backup-' + todayStr() + '.json';
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
@@ -256,9 +288,10 @@ async function listSnapshots() {
   return rows;
 }
 async function restoreData(obj) {
-  if (!obj || obj.app !== 'nibble' || !Array.isArray(obj.foods)) throw new Error('Not a Nibble backup file.');
+  const okApp = obj && (obj.app === 'trackfood' || obj.app === 'nibble');
+  if (!okApp || !Array.isArray(obj.foods)) throw new Error('Not a TrackFood backup file.');
   await dbClear('foods'); await dbClear('users'); await dbClear('entries');
-  for (const f of obj.foods)   await dbPut('foods', f);
+  for (const f of obj.foods)   await dbPut('foods', canonicalizeFood(f));
   for (const u of obj.users)   await dbPut('users', u);
   for (const e of (obj.entries||[])) await dbPut('entries', e);
   if (obj.meta) for (const [k, v] of Object.entries(obj.meta)) await dbPut('meta', { k, v });

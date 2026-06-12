@@ -1,4 +1,4 @@
-/* ===== Nibble: UI primitives (DOM helpers, sheet, toast, formatting) ===== */
+/* ===== TrackFood: UI primitives (DOM helpers, sheet, toast, formatting) ===== */
 'use strict';
 
 /* ---------- tiny DOM helpers ---------- */
@@ -58,10 +58,46 @@ let _toastTimer = null;
 function toast(msg, ms) {
   const t = $('#toast');
   if (!t) return;
-  t.textContent = msg;
+  clear(t);
+  t.appendChild(document.createTextNode(msg));
   t.classList.add('show');
   clearTimeout(_toastTimer);
   _toastTimer = setTimeout(() => t.classList.remove('show'), ms || 1900);
+}
+/* toast with a single action button (e.g. Undo). Action hides the toast. */
+function toastAction(msg, actionLabel, onAction, ms) {
+  const t = $('#toast');
+  if (!t) return;
+  clear(t);
+  t.appendChild(document.createTextNode(msg));
+  t.appendChild(el('button', { onClick: () => {
+    t.classList.remove('show');
+    clearTimeout(_toastTimer);
+    onAction();
+  } }, actionLabel));
+  t.classList.add('show');
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => t.classList.remove('show'), ms || 5000);
+}
+
+/* ---------- long press ----------
+   Calls onLong() after 500 ms of steady press and suppresses the click that
+   follows. Movement or early release falls through to the normal click. */
+function onLongPress(node, onLong) {
+  let timer = null, fired = false;
+  const start = (e) => {
+    fired = false;
+    timer = setTimeout(() => { fired = true; onLong(); }, 500);
+  };
+  const cancel = () => { clearTimeout(timer); timer = null; };
+  node.addEventListener('pointerdown', start);
+  node.addEventListener('pointerup', cancel);
+  node.addEventListener('pointerleave', cancel);
+  node.addEventListener('pointermove', cancel);
+  node.addEventListener('contextmenu', (e) => e.preventDefault());
+  node.addEventListener('click', (e) => {
+    if (fired) { e.stopImmediatePropagation(); e.preventDefault(); fired = false; }
+  }, true);
 }
 
 /* ---------- bottom sheet ---------- */

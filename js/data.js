@@ -1,4 +1,4 @@
-/* ===== Nibble: data definitions (no DOM access in this file) ===== */
+/* ===== TrackFood: data definitions (no DOM access in this file) ===== */
 'use strict';
 
 /* Nutrient registry. Values are always stored per 100 g (or 100 ml for liquids). */
@@ -46,23 +46,63 @@ const DEFAULT_SHOWN   = ['kcal','protein','carbs','fat','sugar','fiber','vita','
 const DEFAULT_STARRED = ['kcal','fiber','calcium','iron','d'];
 const DEFAULT_LIMITS  = ['sugar','sodium'];
 
-/* Categories */
+/* Rail categories (built in; each can be hidden via Settings, and users can add custom ones).
+   'sauces' is a grouped tab that shows the EXTRA_CATS below under headings. */
 const CATS = [
-  { k:'fruit',         label:'Fruit',           emoji:'🍎', color:'#D95D5D' },
-  { k:'veg',           label:'Vegetables',      emoji:'🥦', color:'#5A9E69' },
-  { k:'grains',        label:'Grains',          emoji:'🍞', color:'#C99A3C' },
-  { k:'meat_fish',     label:'Meat & fish',     emoji:'🍗', color:'#BF7048' },
-  { k:'dairy',         label:'Dairy',           emoji:'🧀', color:'#6E97C9' },
-  { k:'misc',          label:'Misc',            emoji:'🍪', color:'#9A78C4' },
+  { k:'fruit',     label:'Fruit',       emoji:'🍎' },
+  { k:'veg',       label:'Vegetables',  emoji:'🥦' },
+  { k:'grains',    label:'Grains',      emoji:'🍞' },
+  { k:'meat_fish', label:'Meat & fish', emoji:'🍗' },
+  { k:'dairy',     label:'Dairy',       emoji:'🧀' },
+  { k:'nuts',      label:'Nuts & seeds',emoji:'🥜' },
+  { k:'drinks',    label:'Drinks',      emoji:'🥤' },
+  { k:'sauces',    label:'Sauces',      emoji:'🥫', grouped:true },
+  { k:'treats',    label:'Treats',      emoji:'🍪' },
+  { k:'misc',      label:'Misc',        emoji:'🍱' },
 ];
-/* Categories that exist as food types but are reached via pinned buttons, not the rail */
+/* Sauce/topping groups: shown under the Sauces tab and used for per-food
+   "prompt to add" follow-ups. */
 const EXTRA_CATS = [
-  { k:'sauce_savoury', label:'Sauce (savoury)', emoji:'🥫', color:'#A85C7E' },
-  { k:'sauce_sweet',   label:'Sauce (sweet)',   emoji:'🍯', color:'#C98A3C' },
-  { k:'condiment',     label:'Oils & condiments', emoji:'🫒', color:'#8A8A6A' },
+  { k:'sauce_savoury', label:'Savoury sauces', emoji:'🥫' },
+  { k:'sauce_sweet',   label:'Sweet sauces',   emoji:'🍯' },
+  { k:'condiment',     label:'Condiments',     emoji:'🧂' },
+  { k:'spread',        label:'Spreads',        emoji:'🫙' },
+  { k:'oil',           label:'Oils',           emoji:'🫒' },
 ];
 const ALL_CATS = CATS.concat(EXTRA_CATS);
 const CAT_BY_KEY = Object.fromEntries(ALL_CATS.map(c => [c.k, c]));
+/* keys a food may belong to (everything except the grouped 'sauces' pseudo-tab) */
+const FOOD_CAT_KEYS = ALL_CATS.filter(c => !c.grouped).map(c => c.k);
+
+/* Recategorisation of built-in foods (applied on seed + on upgrade of existing
+   installs). name (lowercase) -> cats array. Unlisted foods keep their cat. */
+const CAT_REMAP = {
+  /* nuts & seeds (out of misc) */
+  'almonds (ground)':['nuts'], 'cashews':['nuts'], 'walnuts':['nuts'], 'pistachios':['nuts'],
+  'chia seeds':['nuts'], 'sunflower seeds':['nuts'], 'trail mix':['nuts'],
+  'peanut butter':['nuts','spread'],
+  /* treats (out of misc/dairy) */
+  'chocolate (milk)':['treats'], 'chocolate buttons':['treats'], 'crisps':['treats'],
+  'digestive biscuit':['treats'], 'flapjack':['treats'], 'gummy sweets':['treats'],
+  'jelly':['treats'], 'marshmallows':['treats'], 'muffin (blueberry)':['treats'],
+  'plain biscuit (rich tea)':['treats'], 'cereal bar':['treats'], 'yoghurt-coated raisins':['treats'],
+  'doughnut (sugared)':['treats'], 'brownie':['treats'], 'fruit pastilles':['treats'],
+  'scone':['treats'], 'popcorn (plain)':['treats'],
+  'ice cream (vanilla)':['dairy','treats'], 'frozen yoghurt':['dairy','treats'],
+  /* drinks (milks stay visible in dairy too) */
+  'milk (whole)':['dairy','drinks'], 'milk (semi-skimmed)':['dairy','drinks'], 'milk (skimmed)':['dairy','drinks'],
+  'oat milk':['dairy','drinks'], 'almond milk':['dairy','drinks'], 'soy milk':['dairy','drinks'],
+  'yoghurt drink':['dairy','drinks'], 'milkshake':['drinks'],
+  'fruit juice (orange)':['drinks'], 'smoothie (kids carton)':['drinks'], 'squash (diluted)':['drinks'],
+  'hot chocolate (made w/ milk)':['drinks'], 'water':['drinks'],
+  /* spreads */
+  'jam':['spread'], 'strawberry jam':['spread'], 'honey':['spread','sauce_sweet'],
+  'chocolate hazelnut spread':['spread','sauce_sweet'], 'lemon curd':['spread'],
+  'yeast extract (marmite)':['spread'], 'butter (salted)':['dairy','spread'],
+  /* oils (out of condiment) */
+  'olive oil (evoo)':['oil'], 'rapeseed oil':['oil'], 'sunflower oil':['oil'],
+  'vegetable oil':['oil'], 'coconut oil':['oil'], 'sesame oil':['oil'],
+};
 
 /* Default calorie targets by age band (kcal/day, rough midpoints, always overridable) */
 const KCAL_DEFAULT = { '1-3':1200, '4-6':1500, '7-10':1800, '11-14':2200, '15-17':2400, 'adult':2000 };
@@ -158,14 +198,15 @@ const IMPORT_KEYS = {
   zinc_mg:'zinc', potassium_mg:'potassium', sodium_mg:'sodium', phosphorus_mg:'phosphorus',
   copper_mg:'copper', manganese_mg:'manganese', selenium_ug:'selenium', iodine_ug:'iodine',
 };
-const IMPORT_CATS = ['fruit','veg','grains','meat_fish','dairy','misc','sauce_savoury','sauce_sweet','condiment'];
+const IMPORT_CATS = FOOD_CAT_KEYS.slice();
 
 function importTemplate() {
   const nut = {};
   for (const k of Object.keys(IMPORT_KEYS)) nut[k] = 0;
   return JSON.stringify({
     name: 'Food name',
-    category: 'grains  (one of: ' + IMPORT_CATS.join(', ') + ')',
+    categories: ['grains'],
+    categories_available: IMPORT_CATS,
     emoji: '🍽️',
     per: '100g  (or 100ml for liquids)',
     servings: [ { name: '1 portion', grams: 150 } ],
@@ -184,8 +225,13 @@ function parseImport(text) {
   }
   const name = String(obj.name || '').trim();
   if (!name) errors.push('Missing "name".');
-  let cat = String(obj.category || '').trim().toLowerCase().split(/[\s(]/)[0];
-  if (!IMPORT_CATS.includes(cat)) { errors.push('Unknown category "' + (obj.category||'') + '" — using misc.'); cat = 'misc'; }
+  /* accept categories:[..] (new) or category:'..' (old) */
+  let rawCats = Array.isArray(obj.categories) ? obj.categories : [obj.category];
+  let cats = rawCats
+    .map(c => String(c || '').trim().toLowerCase().split(/[\s(]/)[0])
+    .filter(c => IMPORT_CATS.includes(c));
+  if (!cats.length) { errors.push('No valid category — using misc.'); cats = ['misc']; }
+  cats = Array.from(new Set(cats));
   const per = String(obj.per || '100g').includes('ml') ? 'ml' : 'g';
   const emoji = (typeof obj.emoji === 'string' && obj.emoji.trim()) ? obj.emoji.trim() : '🍽️';
   const n = {};
@@ -208,7 +254,7 @@ function parseImport(text) {
     }
   }
   if (!name) return { ok:false, errors };
-  return { ok:true, errors, food: { name, cat, emoji, per, n, servings, src:'import' } };
+  return { ok:true, errors, food: { name, cats, emoji, per, n, servings, src:'import' } };
 }
 
 /* Emoji library for the picker (includes generic plates/bowls for custom foods) */

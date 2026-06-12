@@ -1,4 +1,4 @@
-/* ===== Nibble: seed foods batch 3 (appended to SEED_FOODS) =====
+/* ===== TrackFood: seed foods batch 3 (appended to SEED_FOODS) =====
    More sweet/savoury sauces and common child staples.
    Values per 100 g/ml from CoFID / USDA typical figures. */
 'use strict';

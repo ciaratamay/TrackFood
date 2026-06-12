@@ -1,16 +1,34 @@
-/* ===== Nibble: app screens, flows, and boot ===== */
+/* ===== TrackFood: app screens, flows, and boot ===== */
 'use strict';
 
-const USER_COLORS = ['#E08A4B','#6E97C9','#5A9E69','#C8703A','#9A78C4','#A85C7E','#C99A3C','#5BA6A0'];
-const CONDIMENT_AFTER = new Set(['veg','grains','meat_fish']);
+const USER_COLORS = ['#0E9F6E','#6E8FC9','#C97B4B','#9A78C4','#C95C7E','#3FA8A0','#C9A23C','#5B7D9E'];
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 const WDAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
-const SEG_COLORS = ['#E08A4B','#6E97C9','#5A9E69','#C8703A','#9A78C4','#A85C7E','#C99A3C','#5BA6A0','#B0795A','#7FA86B'];
+const SEG_COLORS = ['#0E9F6E','#6E8FC9','#C97B4B','#9A78C4','#C95C7E','#3FA8A0','#C9A23C','#5B7D9E','#B0795A','#7FA86B'];
 
 let curEntries = [];      /* entries for current user + date */
 let backupWindowDue = -1; /* index of a backup window that is due, or -1 */
+let undoBuffer = null;    /* last deleted entry/entries, one step of undo */
 
-/* ---------- helpers ---------- */
+/* ---------- category helpers ---------- */
+function foodCats(f) { return Array.isArray(f.cats) ? f.cats : [f.cat || 'misc']; }
+function foodInCat(f, k) { return foodCats(f).includes(k); }
+function customCats() { return State.meta.customCats || []; }
+function disabledCats() { return new Set(State.meta.disabledCats || []); }
+/* tabs on the rail: enabled built-ins + user-added customs */
+function railCats() {
+  const dis = disabledCats();
+  return CATS.filter(c => !dis.has(c.k)).concat(customCats());
+}
+/* categories a food can belong to (everything except the grouped Sauces tab) */
+function selectableCats() {
+  return CATS.filter(c => !c.grouped).concat(EXTRA_CATS).concat(customCats());
+}
+function catInfoOf(k) {
+  return CAT_BY_KEY[k] || customCats().find(c => c.k === k) || { k, label: k, emoji: '\uD83C\uDF7D\uFE0F' };
+}
+
+/* ---------- small helpers ---------- */
 function userColor(u, idx) { return u.color || USER_COLORS[idx % USER_COLORS.length]; }
 function isLimitFor(key, u) { return (u.limits || []).includes(key); }
 function formatQty(q) {
@@ -44,18 +62,40 @@ function render() {
   const app = $('#app');
   clear(app);
   app.appendChild(topBar());
+  app.appendChild(userBar());
   if (backupWindowDue >= 0) app.appendChild(backupBanner());
-  app.appendChild(el('div', { class: 'body' }, [userRail(), catRail(), panel()]));
+  app.appendChild(el('div', { class: 'body' }, [catRail(), panel()]));
 }
 
 function topBar() {
-  const u = currentUser();
   return el('div', { class: 'topbar' }, [
     el('button', { class: 'iconbtn', 'aria-label': 'Menu', onClick: openMenu }, '\u2630'),
-    el('div', { class: 'brand serif' }, 'Nibble'),
+    el('div', { class: 'brand' }, 'TrackFood'),
     el('div', { class: 'spacer' }),
-    el('div', { class: 'muted', style: { fontSize: '13px', fontWeight: '600' } }, u ? u.name : ''),
   ]);
+}
+
+/* horizontal user chips */
+function userBar() {
+  const bar = el('div', { class: 'userbar' });
+  State.users.forEach((u, i) => {
+    const chip = el('button', {
+      class: 'uchip' + (u.id === State.currentUserId ? ' sel' : ''),
+      onClick: () => {
+        if (u.id === State.currentUserId) { openUserEditor(u); return; }
+        State.currentUserId = u.id;
+        saveMeta('currentUserId', u.id);
+        rerender();
+      },
+    }, [
+      el('span', { class: 'av', style: { background: userColor(u, i) } },
+        (u.name || '?').trim().charAt(0).toUpperCase() || '?'),
+      el('span', null, u.name || '?'),
+    ]);
+    bar.appendChild(chip);
+  });
+  bar.appendChild(el('button', { class: 'uchip add', onClick: () => openUserEditor(null) }, '\uFF0B Add'));
+  return bar;
 }
 
 function backupBanner() {
@@ -68,28 +108,9 @@ function backupBanner() {
   ]);
 }
 
-function userRail() {
-  const rail = el('div', { class: 'rail-users' });
-  State.users.forEach((u, i) => {
-    const av = el('button', {
-      class: 'avatar' + (u.id === State.currentUserId ? ' sel' : ''),
-      style: { background: userColor(u, i) },
-      onClick: () => {
-        if (u.id === State.currentUserId) { openUserEditor(u); return; }
-        State.currentUserId = u.id;
-        saveMeta('currentUserId', u.id);
-        rerender();
-      },
-    }, (u.name || '?').trim().charAt(0).toUpperCase() || '?');
-    rail.appendChild(av);
-  });
-  rail.appendChild(el('button', { class: 'avatar add', 'aria-label': 'Add person', onClick: () => openUserEditor(null) }, '+'));
-  return rail;
-}
-
 function catRail() {
   const rail = el('div', { class: 'rail-cats' });
-  const tabs = [{ k: 'diary', label: 'Diary', emoji: '\uD83D\uDCD3' }].concat(CATS);
+  const tabs = [{ k: 'diary', label: 'Diary', emoji: '\uD83D\uDCD3' }].concat(railCats());
   tabs.forEach(c => {
     const tab = el('button', {
       class: 'cattab' + (State.currentCat === c.k ? ' sel' : ''),
@@ -103,11 +124,14 @@ function catRail() {
 function panel() {
   const p = el('div', { class: 'panel' });
   p.appendChild(dateStrip());
-  if (State.currentCat === 'diary') {
+  const cur = State.currentCat;
+  if (cur === 'diary') {
     p.appendChild(barsBlock());
     p.appendChild(el('div', { class: 'scroll' }, diaryList()));
+  } else if (CAT_BY_KEY[cur] && CAT_BY_KEY[cur].grouped) {
+    p.appendChild(el('div', { class: 'scroll' }, saucesPanel()));
   } else {
-    p.appendChild(el('div', { class: 'scroll' }, foodGrid(State.currentCat)));
+    p.appendChild(el('div', { class: 'scroll' }, foodGrid(cur)));
   }
   return p;
 }
@@ -184,7 +208,6 @@ function arrangeEntries(entries) {
     out.push({ e, sub: false });
     for (const s of (subsByParent[e.id] || [])) out.push({ e: s, sub: true });
   }
-  /* orphaned sub-entries (parent removed): show as normal rows */
   for (const e of sorted) if (e.parentId && !topIds.has(e.parentId)) out.push({ e, sub: false });
   return out;
 }
@@ -216,30 +239,46 @@ function diaryList() {
 
 /* ---------- food grid (logging) ---------- */
 function pin(label, onClick, primary) { return el('button', { class: 'pin' + (primary ? ' primary' : ''), onClick }, label); }
+
 function foodTile(f, onClick) {
-  return el('button', { class: 'tile', onClick: onClick || (() => openServingSheet(f)) }, [
+  const t = el('button', { class: 'tile', onClick: onClick || (() => openServingSheet(f)) }, [
     el('div', { class: 'e' }, f.emoji || '\uD83C\uDF7D\uFE0F'),
     el('div', { class: 'nm' }, f.name),
   ]);
+  onLongPress(t, () => openFoodActions(f));
+  return t;
+}
+
+/* long-press action sheet for any food */
+function openFoodActions(f) {
+  openSheet([sheetHead(f.name, f.emoji), sheetBody([
+    el('button', { class: 'btn ghost', onClick: () => openFoodEditor(f) }, '\u270F\uFE0F Edit (name, icon, categories, nutrients)'),
+    el('button', { class: 'btn danger', style: { marginTop: '8px' }, onClick: () => {
+      confirmSheet({ title: 'Delete \u201C' + f.name + '\u201D?', body: 'It disappears from your food lists. Past diary days that used it will show \u201C(deleted food)\u201D.',
+        danger: true, okLabel: 'Delete', onOk: async () => { await deleteFood(f.id); toast('Deleted'); await rerender(); } });
+    } }, '\uD83D\uDDD1 Delete food'),
+  ])]);
+}
+
+function standardPins(presetCat) {
+  return [
+    pin('\uFF0B Add food', () => openFoodEditor(null, presetCat), true),
+    pin('\uD83D\uDCD6 Recipe', () => openRecipeBuilder(presetCat)),
+    pin('\u2B07 Import', () => openImport()),
+    pin('\uD83C\uDF10 Online', () => openOffSearch(presetCat)),
+  ];
 }
 
 function foodGrid(cat) {
   const wrap = el('div', { class: 'grid-wrap' });
-  const pinned = el('div', { class: 'pinned' }, [
-    pin('\uFF0B Add food', () => openFoodEditor(null, cat), true),
-    pin('\uD83D\uDCD6 Recipe', () => openRecipeBuilder(cat)),
-    pin('\u2B07 Import', () => openImport()),
-    pin('\uD83C\uDF10 Online', () => openOffSearch(cat)),
-    pin('\uD83C\uDF6F Sauce (sweet)', () => openCategoryLogger('sauce_sweet', 'Sweet sauces')),
-    pin('\uD83E\uDD6B Sauce (savoury)', () => openCategoryLogger('sauce_savoury', 'Savoury sauces')),
-  ]);
-  const catLabel = CAT_BY_KEY[cat] ? CAT_BY_KEY[cat].label.toLowerCase() : 'foods';
+  const pinned = el('div', { class: 'pinned' }, standardPins(cat));
+  const info = catInfoOf(cat);
   const tiles = el('div', { class: 'tiles' });
-  const search = el('input', { class: 'search', type: 'search', placeholder: 'Search ' + catLabel + '\u2026',
+  const search = el('input', { class: 'search', type: 'search', placeholder: 'Search ' + info.label.toLowerCase() + '\u2026',
     oninput: () => renderTiles(search.value) });
 
   function listFor(filter) {
-    let list = State.foods.filter(f => f.cat === cat);
+    let list = State.foods.filter(f => foodInCat(f, cat));
     if (filter) { const q = filter.toLowerCase(); list = list.filter(f => f.name.toLowerCase().includes(q)); }
     list.sort((a, b) => (b.uses || 0) - (a.uses || 0) || a.name.localeCompare(b.name));
     return list;
@@ -247,7 +286,7 @@ function foodGrid(cat) {
   function renderTiles(filter) {
     clear(tiles);
     const list = listFor(filter);
-    if (!list.length) { tiles.appendChild(el('div', { class: 'tiles-empty' }, 'No foods here yet. Tap \u201CAdd food\u201D to create one.')); return; }
+    if (!list.length) { tiles.appendChild(el('div', { class: 'tiles-empty' }, 'No foods here yet. Tap \u201CAdd food\u201D to create one, or long-press any food elsewhere to edit its categories.')); return; }
     list.forEach(f => tiles.appendChild(foodTile(f)));
   }
   renderTiles('');
@@ -255,27 +294,33 @@ function foodGrid(cat) {
   return wrap;
 }
 
-/* a sheet that lists foods of a category and logs the chosen one (sauces, etc.) */
-function openCategoryLogger(cat, title) {
-  const c = CAT_BY_KEY[cat] || { emoji: '\uD83C\uDF7D\uFE0F' };
-  const tiles = el('div', { class: 'tiles' });
+/* Sauces tab: all five groups under headings */
+function saucesPanel() {
+  const wrap = el('div', { class: 'grid-wrap' });
+  wrap.appendChild(el('div', { class: 'pinned' }, standardPins('sauce_savoury')));
+  const search = el('input', { class: 'search', type: 'search', placeholder: 'Search sauces, spreads, oils\u2026' });
+  const groupsBox = el('div');
   function draw(filter) {
-    clear(tiles);
-    let list = State.foods.filter(f => f.cat === cat);
-    if (filter) { const q = filter.toLowerCase(); list = list.filter(f => f.name.toLowerCase().includes(q)); }
-    list.sort((a, b) => (b.uses || 0) - (a.uses || 0) || a.name.localeCompare(b.name));
-    if (!list.length) { tiles.appendChild(el('div', { class: 'tiles-empty' }, 'None yet \u2014 create one below.')); return; }
-    list.forEach(f => tiles.appendChild(foodTile(f, () => openServingSheet(f, { noFollowup: true }))));
+    clear(groupsBox);
+    const q = (filter || '').toLowerCase();
+    let any = false;
+    EXTRA_CATS.forEach(g => {
+      let list = State.foods.filter(f => foodInCat(f, g.k));
+      if (q) list = list.filter(f => f.name.toLowerCase().includes(q));
+      if (!list.length) return;
+      any = true;
+      list.sort((a, b) => (b.uses || 0) - (a.uses || 0) || a.name.localeCompare(b.name));
+      groupsBox.appendChild(el('div', { class: 'grouphead' }, g.label));
+      const tiles = el('div', { class: 'tiles' });
+      list.forEach(f => tiles.appendChild(foodTile(f)));
+      groupsBox.appendChild(tiles);
+    });
+    if (!any) groupsBox.appendChild(el('div', { class: 'tiles-empty' }, 'No matches.'));
   }
-  const search = el('input', { class: 'search', type: 'search', placeholder: 'Search\u2026', oninput: () => draw(search.value) });
+  search.addEventListener('input', () => draw(search.value));
   draw('');
-  openSheet([sheetHead(title, c.emoji), sheetBody([
-    el('div', { class: 'pinned' }, [
-      pin('\uFF0B New', () => openFoodEditor(null, cat), true),
-      pin('\u2B07 Import', () => openImport()),
-    ]),
-    search, tiles,
-  ])]);
+  wrap.append(search, groupsBox);
+  return wrap;
 }
 
 /* ---------- serving picker / logging ---------- */
@@ -362,18 +407,27 @@ function openServingSheet(food, opts) {
         const e = await addEntry(food.id, q, serving);
         if (opts.parentId) { e.parentId = opts.parentId; await updateEntry(e); }
         closeSheet(); await rerender();
-        if (!opts.noFollowup && !opts.parentId && CONDIMENT_AFTER.has(food.cat)) openCondimentFollowup(e.id);
+        const groups = (food.promptAdd || []).filter(k => EXTRA_CATS.some(g => g.k === k));
+        if (!opts.noFollowup && !opts.parentId && groups.length) openToppingFollowup(e.id, groups);
         else toast('Added');
       }
     })();
   }
+  /* entries delete without confirmation, with one step of undo */
   function doDelete() {
-    confirmSheet({ title: 'Delete this entry?', danger: true, okLabel: 'Delete', onOk: async () => {
-      await deleteEntry(opts.editEntry.id);
-      /* also remove its sub-entries */
-      for (const s of curEntries) if (s.parentId === opts.editEntry.id) await deleteEntry(s.id);
-      closeSheet(); toast('Deleted'); await rerender();
-    } });
+    (async () => {
+      const removed = [opts.editEntry];
+      for (const s of curEntries) if (s.parentId === opts.editEntry.id) removed.push(s);
+      for (const r of removed) await deleteEntry(r.id);
+      undoBuffer = removed;
+      closeSheet(); await rerender();
+      toastAction('Entry deleted', 'Undo', async () => {
+        if (!undoBuffer) return;
+        for (const r of undoBuffer) await updateEntry(r); /* dbPut restores it */
+        undoBuffer = null;
+        await rerender();
+      });
+    })();
   }
   function buildMain() {
     rebuildList(); updatePreview();
@@ -393,24 +447,37 @@ function openServingSheet(food, opts) {
 
 function openEntryEditor(entry) {
   const f = State.foodById[entry.foodId];
-  if (!f) { confirmSheet({ title: 'Remove this entry?', body: 'Its food no longer exists.', danger: true, okLabel: 'Remove',
-    onOk: async () => { await deleteEntry(entry.id); closeSheet(); await rerender(); } }); return; }
+  if (!f) {
+    (async () => {
+      await deleteEntry(entry.id);
+      undoBuffer = [entry];
+      await rerender();
+      toastAction('Removed (its food was deleted)', 'Undo', async () => {
+        if (!undoBuffer) return;
+        for (const r of undoBuffer) await updateEntry(r);
+        undoBuffer = null;
+        await rerender();
+      });
+    })();
+    return;
+  }
   openServingSheet(f, { editEntry: entry });
 }
 
-function openCondimentFollowup(parentId) {
-  function group(cat, title) {
-    const foods = State.foods.filter(f => f.cat === cat).sort((a, b) => (b.uses || 0) - (a.uses || 0) || a.name.localeCompare(b.name));
+/* follow-up offering only the groups this food asks for */
+function openToppingFollowup(parentId, groupKeys) {
+  function group(catKey) {
+    const g = EXTRA_CATS.find(x => x.k === catKey);
+    if (!g) return null;
+    const foods = State.foods.filter(f => foodInCat(f, catKey)).sort((a, b) => (b.uses || 0) - (a.uses || 0) || a.name.localeCompare(b.name));
     if (!foods.length) return null;
-    const wrap = el('div', { class: 'addmore' }, [el('div', { class: 'lbl' }, title)]);
+    const wrap = el('div', { class: 'addmore' }, [el('div', { class: 'lbl' }, g.label)]);
     foods.forEach(f => wrap.appendChild(pin((f.emoji || '') + ' ' + f.name, () => openServingSheet(f, { parentId, noFollowup: true }))));
     return wrap;
   }
-  openSheet([sheetHead('Add oil, sauce or topping?'), sheetBody([
+  openSheet([sheetHead('Add anything on it?'), sheetBody([
     el('div', { class: 'muted', style: { marginTop: '0', fontSize: '13px' } }, 'Optional \u2014 each one is logged under the food you just added.'),
-    group('condiment', 'Oils & condiments'),
-    group('sauce_savoury', 'Savoury sauces'),
-    group('sauce_sweet', 'Sweet sauces'),
+    groupKeys.map(group),
     el('button', { class: 'btn ghost', style: { marginTop: '14px' }, onClick: closeSheet }, 'Done'),
   ])]);
 }
@@ -438,7 +505,7 @@ function openNutrientDetail(key) {
 
   openSheet([sheetHead(labelOf(key)), sheetBody([
     el('div', { class: 'center', style: { margin: '2px 0 6px' } }, [
-      el('div', { class: 'num', style: { fontSize: '26px', fontWeight: '600' } }, nVal(key, total) + ' ' + unitOf(key)),
+      el('div', { class: 'num', style: { fontSize: '26px', fontWeight: '700' } }, nVal(key, total) + ' ' + unitOf(key)),
       target ? el('div', { class: 'muted', style: { fontSize: '13px' } }, (isLimitFor(key, u) ? 'limit ' : 'target ') + nVal(key, target) + ' ' + unitOf(key)) : null,
     ]),
     contribs.length ? stack : null,
@@ -461,18 +528,31 @@ function showSuggestions(key) {
   ])]);
 }
 
+/* ---------- shared editor widgets ---------- */
+/* grid of checkboxes; returns {node, get()} of selected keys */
+function checkGroup(items, selected) {
+  const sel = new Set(selected || []);
+  const node = el('div', { class: 'checkwrap' });
+  items.forEach(it => {
+    const cb = el('input', { type: 'checkbox', checked: sel.has(it.k) });
+    cb.addEventListener('change', () => { cb.checked ? sel.add(it.k) : sel.delete(it.k); });
+    node.appendChild(el('label', { class: 'check' }, [cb, el('span', null, (it.emoji ? it.emoji + ' ' : '') + it.label)]));
+  });
+  return { node, get: () => items.map(i => i.k).filter(k => sel.has(k)) };
+}
+
 /* ---------- custom food editor ---------- */
 function emptyFood(cat) {
-  return { id: null, name: '', emoji: '\uD83C\uDF7D\uFE0F', cat: cat || 'misc', per: 'g', n: {}, servings: [], src: 'custom', uses: 0, lastUsed: 0 };
+  return { id: null, name: '', emoji: '\uD83C\uDF7D\uFE0F', cats: [cat || 'misc'], per: 'g', n: {}, servings: [], promptAdd: [], src: 'custom', uses: 0, lastUsed: 0 };
 }
 function openFoodEditor(existing, presetCat) {
   const food = existing
-    ? JSON.parse(JSON.stringify(existing))
+    ? canonicalizeFood(JSON.parse(JSON.stringify(existing)))
     : emptyFood(presetCat);
   const nameI = textInput({ value: food.name, placeholder: 'Food name' });
   const picker = emojiPicker(food.emoji);
-  const catSel = el('select', null, ALL_CATS.map(c => el('option', { value: c.k }, c.label)));
-  catSel.value = food.cat;
+  const catChecks = checkGroup(selectableCats(), food.cats);
+  const promptChecks = checkGroup(EXTRA_CATS, food.promptAdd);
   const perSel = el('select', null, [el('option', { value: 'g' }, 'grams (g)'), el('option', { value: 'ml' }, 'millilitres (ml)')]);
   perSel.value = food.per || 'g';
 
@@ -506,6 +586,8 @@ function openFoodEditor(existing, presetCat) {
   function save() {
     const name = (nameI.value || '').trim();
     if (!name) { toast('Give the food a name'); return; }
+    let cats = catChecks.get();
+    if (!cats.length) cats = ['misc'];
     const cleanServs = servs.filter(s => s.name.trim() && s.grams > 0).map(s => ({ name: s.name.trim(), grams: Number(s.grams) }));
     const n = {};
     for (const nt of NUTR) {
@@ -514,8 +596,8 @@ function openFoodEditor(existing, presetCat) {
     }
     const out = {
       id: food.id || uid('f_'),
-      name, emoji: picker.get(), cat: catSel.value, per: perSel.value,
-      n, servings: cleanServs,
+      name, emoji: picker.get(), cats, per: perSel.value,
+      n, servings: cleanServs, promptAdd: promptChecks.get(),
       src: food.src || 'custom', uses: food.uses || 0, lastUsed: food.lastUsed || 0,
     };
     (async () => {
@@ -531,12 +613,18 @@ function openFoodEditor(existing, presetCat) {
   openSheet([sheetHead(existing ? 'Edit food' : 'New food'), sheetBody([
     field('Name', nameI),
     field('Icon', picker.node),
-    el('div', { class: 'field2' }, [field('Category', catSel), field('Measured per', perSel)]),
+    el('div', { class: 'subhead' }, 'Categories'),
+    el('div', { class: 'hint', style: { marginTop: '-4px', marginBottom: '6px' } }, 'Tick every list this food should appear in.'),
+    catChecks.node,
+    field('Measured per', perSel),
     el('div', { class: 'subhead' }, 'Servings'),
-    el('div', { class: 'hint', style: { marginTop: '-4px', marginBottom: '8px' } }, 'Weight of one of each serving. You can always enter exact ' + (food.per || 'g') + ' when logging.'),
+    el('div', { class: 'hint', style: { marginTop: '-4px', marginBottom: '8px' } }, 'Weight of one of each serving. You can always enter exact g/ml when logging.'),
     servBox,
-    el('div', { class: 'subhead' }, 'Nutrients per 100 ' + (perSel.value) + ''),
-    el('div', { class: 'hint', style: { marginTop: '-4px', marginBottom: '8px' } }, 'Leave a box blank for \u201Cno data\u201D. Values are per 100 g/ml.'),
+    el('div', { class: 'subhead' }, 'Prompt to add after logging'),
+    el('div', { class: 'hint', style: { marginTop: '-4px', marginBottom: '6px' } }, 'After you log this food, offer these toppings (e.g. savoury sauce for pasta, spreads for bread). Leave all unticked for no prompt.'),
+    promptChecks.node,
+    el('div', { class: 'subhead' }, 'Nutrients per 100 g/ml'),
+    el('div', { class: 'hint', style: { marginTop: '-4px', marginBottom: '8px' } }, 'Leave a box blank for \u201Cno data\u201D.'),
     grid,
     el('button', { class: 'btn', style: { marginTop: '16px' }, onClick: save }, 'Save food'),
     existing ? el('button', { class: 'btn danger', style: { marginTop: '8px' }, onClick: removeFood }, 'Delete food') : null,
@@ -548,8 +636,7 @@ function openRecipeBuilder(presetCat) {
   const ingredients = []; /* {food, grams} */
   const nameI = textInput({ placeholder: 'e.g. Mum\u2019s lasagne' });
   const picker = emojiPicker('\uD83C\uDF72');
-  const catSel = el('select', null, ALL_CATS.map(c => el('option', { value: c.k }, c.label)));
-  catSel.value = presetCat || 'misc';
+  const catChecks = checkGroup(selectableCats(), [presetCat || 'misc']);
   const servingsI = numInput({ value: 4, step: '1', min: '1' });
   const ingBox = el('div');
   const summary = el('div');
@@ -651,13 +738,15 @@ function openRecipeBuilder(presetCat) {
     const { t, g } = totalsAndGrams();
     if (!(g > 0)) { toast('Ingredient weights are zero'); return; }
     const servCount = Math.max(1, Math.round(parseNum(servingsI.value, 1)));
+    let cats = catChecks.get();
+    if (!cats.length) cats = ['misc'];
     const n = {};
     for (const [k, v] of Object.entries(t)) n[k] = v / g * 100; /* per 100 g */
     const portion = g / servCount;
     const out = {
-      id: uid('f_'), name, emoji: picker.get(), cat: catSel.value, per: 'g',
+      id: uid('f_'), name, emoji: picker.get(), cats, per: 'g',
       n, servings: [{ name: '1 portion', grams: Math.round(portion) }, { name: 'whole recipe', grams: Math.round(g) }],
-      src: 'recipe', uses: 0, lastUsed: 0,
+      promptAdd: [], src: 'recipe', uses: 0, lastUsed: 0,
     };
     (async () => { await saveFood(out); closeSheet(); toast('Recipe saved as a food'); await rerender(); })();
   }
@@ -666,7 +755,9 @@ function openRecipeBuilder(presetCat) {
     return [sheetHead('New recipe'), sheetBody([
       field('Recipe name', nameI),
       field('Icon', picker.node),
-      el('div', { class: 'field2' }, [field('Category', catSel), field('Makes (servings)', servingsI)]),
+      el('div', { class: 'subhead' }, 'Categories'),
+      catChecks.node,
+      field('Makes (servings)', servingsI),
       el('div', { class: 'subhead' }, 'Ingredients'),
       ingBox,
       summary,
@@ -690,14 +781,15 @@ function openImport() {
     }
     const f = res.food;
     const nCount = Object.keys(f.n).length;
+    const catLabels = f.cats.map(k => catInfoOf(k).label).join(', ');
     preview.appendChild(el('div', { class: 'seclist' }, [
-      el('div', { class: 'row' }, [el('div', { class: 'e', style: { fontSize: '26px' } }, f.emoji), el('div', { class: 'grow' }, [el('div', { style: { fontWeight: '600' } }, f.name), el('small', null, (CAT_BY_KEY[f.cat] ? CAT_BY_KEY[f.cat].label : f.cat) + ' \u00b7 ' + nCount + ' nutrients \u00b7 ' + (f.servings.length) + ' serving(s)')])]),
+      el('div', { class: 'row' }, [el('div', { class: 'e', style: { fontSize: '26px' } }, f.emoji), el('div', { class: 'grow' }, [el('div', { style: { fontWeight: '600' } }, f.name), el('small', null, catLabels + ' \u00b7 ' + nCount + ' nutrients \u00b7 ' + (f.servings.length) + ' serving(s)')])]),
     ]));
     if (res.errors.length) preview.appendChild(el('div', { class: 'hint' }, res.errors.join(' ')));
     preview.appendChild(el('button', { class: 'btn', style: { marginTop: '10px' }, onClick: () => {
-      const out = { id: uid('f_'), name: f.name, emoji: f.emoji, cat: f.cat, per: f.per, n: f.n,
-        servings: f.servings.length ? f.servings : [], src: 'import', uses: 0, lastUsed: 0 };
-      (async () => { await saveFood(out); closeSheet(); toast('Imported \u201C' + f.name + '\u201D'); await rerender(); })();
+      const out = canonicalizeFood({ id: uid('f_'), name: f.name, emoji: f.emoji, cats: f.cats, per: f.per, n: f.n,
+        servings: f.servings.length ? f.servings : [], src: 'import', uses: 0, lastUsed: 0 });
+      (async () => { await saveFood(out); closeSheet(); toast('Imported \u201C' + f.name + '\u201D \u2014 long-press it any time to edit'); await rerender(); })();
     } }, 'Save imported food'));
   }
   openSheet([sheetHead('Import food'), sheetBody([
@@ -735,34 +827,47 @@ function mapOff(nutriments) {
   }
   return n;
 }
+/* Two endpoints: the new Search-a-licious API (CORS-friendly), then the
+   classic cgi search as a fallback. */
+async function offQuery(q) {
+  const fields = 'product_name,brands,nutriments';
+  try {
+    const r = await fetch('https://search.openfoodfacts.org/search?q=' + encodeURIComponent(q) +
+      '&page_size=20&fields=' + fields);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    const hits = data.hits || data.products || [];
+    if (hits.length) return hits;
+  } catch (e) { /* fall through to legacy endpoint */ }
+  const r2 = await fetch('https://world.openfoodfacts.org/cgi/search.pl?search_terms=' + encodeURIComponent(q) +
+    '&search_simple=1&action=process&json=1&page_size=20&fields=' + fields);
+  if (!r2.ok) throw new Error('HTTP ' + r2.status);
+  const data2 = await r2.json();
+  return data2.products || [];
+}
 function openOffSearch(cat) {
   const input = el('input', { class: 'search', type: 'search', placeholder: 'Search products online\u2026' });
-  const results = el('div', { class: 'tiles' });
+  const results = el('div', { class: 'servlist' });
   const status = el('div', { class: 'muted', style: { fontSize: '13px', padding: '4px 0' } });
   async function run() {
     const q = (input.value || '').trim();
     if (!q) return;
     status.textContent = 'Searching\u2026'; clear(results);
     try {
-      const url = 'https://world.openfoodfacts.org/cgi/search.pl?search_terms=' + encodeURIComponent(q) +
-        '&search_simple=1&action=process&json=1&page_size=20' +
-        '&fields=product_name,brands,nutriments,quantity';
-      const r = await fetch(url);
-      const data = await r.json();
-      const prods = (data.products || []).filter(p => p.product_name && p.nutriments);
+      const prods = (await offQuery(q)).filter(p => p.product_name && p.nutriments);
       status.textContent = prods.length ? '' : 'No results. Try different words, or add the food manually.';
       prods.forEach(p => {
         const nm = p.product_name + (p.brands ? (' \u00b7 ' + String(p.brands).split(',')[0]) : '');
         results.appendChild(el('div', { class: 'servopt', onClick: () => {
           const n = mapOff(p.nutriments);
-          const per = 'g';
-          const food = { id: uid('f_'), name: p.product_name, emoji: '\uD83C\uDF7D\uFE0F', cat,
-            per, n, servings: [{ name: '100 ' + per, grams: 100 }], src: 'off', uses: 0, lastUsed: 0 };
-          (async () => { await saveFood(food); toast('Added \u2014 set servings, then log it'); await rerender(); openServingSheet(food); })();
+          const food = canonicalizeFood({ id: uid('f_'), name: p.product_name, emoji: '\uD83C\uDF7D\uFE0F',
+            cats: [cat || 'misc'], per: 'g', n, servings: [{ name: '100 g', grams: 100 }],
+            src: 'off', uses: 0, lastUsed: 0 });
+          (async () => { await saveFood(food); toast('Added \u2014 long-press it to edit categories or servings'); await rerender(); openServingSheet(food); })();
         } }, [el('span', null, nm), el('span', { class: 'g' }, (p.nutriments['energy-kcal_100g'] != null ? Math.round(p.nutriments['energy-kcal_100g']) + ' kcal/100g' : ''))]));
       });
     } catch (e) {
-      status.textContent = 'Could not reach Open Food Facts (offline?). You can add the food manually instead.';
+      status.textContent = 'Search failed (' + (e.message || 'network error') + '). If this keeps happening the food database may be temporarily down \u2014 you can add the food manually instead.';
     }
   }
   input.addEventListener('keydown', e => { if (e.key === 'Enter') run(); });
@@ -786,7 +891,7 @@ function openManageFoods() {
       tiles.appendChild(el('div', { class: 'row', onClick: () => openFoodEditor(f) }, [
         el('div', { class: 'e', style: { fontSize: '22px' } }, f.emoji || '\uD83C\uDF7D\uFE0F'),
         el('div', { class: 'grow' }, [el('div', { style: { fontWeight: '600', fontSize: '14px' } }, f.name),
-          el('small', null, (CAT_BY_KEY[f.cat] ? CAT_BY_KEY[f.cat].label : f.cat) + (f.src && f.src !== 'builtin' ? ' \u00b7 ' + f.src : ''))]),
+          el('small', null, foodCats(f).map(k => catInfoOf(k).label).join(', ') + (f.src && f.src !== 'builtin' ? ' \u00b7 ' + f.src : ''))]),
         el('div', { class: 'tag' }, nVal('kcal', f.n.kcal || 0) + ' kcal'),
       ]));
     });
@@ -797,6 +902,77 @@ function openManageFoods() {
   openSheet([sheetHead('Manage foods'), sheetBody([
     el('div', { class: 'pinned' }, [pin('\uFF0B Add food', () => openFoodEditor(null, 'misc'), true), pin('\uD83D\uDCD6 Recipe', () => openRecipeBuilder())]),
     search, tiles,
+  ])]);
+}
+
+/* ---------- categories manager (universal, in Settings) ---------- */
+function openCategories() {
+  const dis = new Set(State.meta.disabledCats || []);
+  const builtinBox = el('div');
+  CATS.forEach(c => {
+    const cb = el('input', { type: 'checkbox', checked: !dis.has(c.k) });
+    cb.addEventListener('change', () => { cb.checked ? dis.delete(c.k) : dis.add(c.k); });
+    builtinBox.appendChild(el('label', { class: 'check' }, [cb, el('span', null, c.emoji + ' ' + c.label)]));
+  });
+
+  const customBox = el('div');
+  function drawCustom() {
+    clear(customBox);
+    const customs = State.meta.customCats || [];
+    if (!customs.length) customBox.appendChild(el('div', { class: 'muted', style: { fontSize: '13px', padding: '4px 0' } }, 'No custom categories yet.'));
+    customs.forEach(c => {
+      customBox.appendChild(el('div', { class: 'row', style: { border: '1px solid var(--line)', borderRadius: '10px', marginBottom: '6px', padding: '10px 12px', display: 'flex', alignItems: 'center', gap: '10px' } }, [
+        el('span', { style: { fontSize: '20px' } }, c.emoji),
+        el('span', { style: { flex: '1', fontWeight: '600', fontSize: '14px' } }, c.label),
+        el('button', { class: 'iconbtn', 'aria-label': 'Remove', onClick: () => {
+          confirmSheet({ title: 'Remove \u201C' + c.label + '\u201D?', body: 'Foods in it keep their other categories; any food only in this category moves to Misc.',
+            danger: true, okLabel: 'Remove', onOk: async () => {
+              State.meta.customCats = (State.meta.customCats || []).filter(x => x.k !== c.k);
+              await saveMeta('customCats', State.meta.customCats);
+              for (const f of State.foods) {
+                if (foodInCat(f, c.k)) {
+                  f.cats = foodCats(f).filter(k => k !== c.k);
+                  if (!f.cats.length) f.cats = ['misc'];
+                  await saveFood(f);
+                }
+              }
+              if (State.currentCat === c.k) State.currentCat = 'diary';
+              openCategories(); await rerender();
+            } });
+        } }, '\u2715'),
+      ]));
+    });
+  }
+  drawCustom();
+
+  const newName = textInput({ placeholder: 'e.g. Breakfast, Lunch, Dinner' });
+  const newPicker = emojiPicker('\uD83C\uDF71');
+
+  openSheet([sheetHead('Categories'), sheetBody([
+    el('div', { class: 'muted', style: { marginTop: '0', fontSize: '13px' } }, 'Applies to the whole app, for everyone.'),
+    el('div', { class: 'subhead' }, 'Built-in tabs'),
+    el('div', { class: 'hint', style: { marginTop: '-4px', marginBottom: '6px' } }, 'Untick to hide a tab. Foods keep their categories, so re-ticking brings everything back.'),
+    builtinBox,
+    el('div', { class: 'subhead' }, 'Your categories'),
+    customBox,
+    field('New category name', newName),
+    field('Icon', newPicker.node),
+    el('button', { class: 'btn ghost sm', onClick: async () => {
+      const label = (newName.value || '').trim();
+      if (!label) { toast('Name the category'); return; }
+      const c = { k: 'c_' + uid(''), label, emoji: newPicker.get() };
+      State.meta.customCats = (State.meta.customCats || []).concat([c]);
+      await saveMeta('customCats', State.meta.customCats);
+      newName.value = '';
+      drawCustom(); render();
+      toast('Added \u2014 tick it on any food to use it');
+    } }, '\uFF0B Add category'),
+    el('button', { class: 'btn', style: { marginTop: '16px' }, onClick: async () => {
+      State.meta.disabledCats = Array.from(dis);
+      await saveMeta('disabledCats', State.meta.disabledCats);
+      if (dis.has(State.currentCat)) State.currentCat = 'diary';
+      closeSheet(); toast('Saved'); render();
+    } }, 'Save'),
   ])]);
 }
 
@@ -821,13 +997,14 @@ function openUserEditor(existing) {
     swatches.appendChild(sw);
   });
 
-  /* nutrient settings table */
+  /* nutrient settings table — energy lives in the field above, so skip kcal here */
   const shown = new Set(u.shown && u.shown.length ? u.shown : DEFAULT_SHOWN);
   const starred = new Set(u.starred && u.starred.length ? u.starred : DEFAULT_STARRED);
   const limits = new Set(u.limits && u.limits.length ? u.limits : DEFAULT_LIMITS);
   const targetInputs = {};
   const nutrTable = el('div');
   NUTR.forEach(nt => {
+    if (nt.k === 'kcal') return; /* single source of truth: the energy field above */
     const draft = { dob: dobI.value, sex: sexSel.value, kcalTarget: parseNum(kcalI.value, null), targets: u.targets || {} };
     const def = defaultTarget(nt.k, draft);
     const tgt = el('input', { class: 'tgt num', type: 'number', step: 'any', min: '0',
@@ -857,9 +1034,9 @@ function openUserEditor(existing) {
   function drawGrowth() {
     clear(growthBox);
     measures.forEach((m, i) => {
-      growthBox.appendChild(el('div', { class: 'row', style: { borderRadius: '10px', border: '1px solid var(--line)', marginBottom: '6px' } }, [
-        el('div', { class: 'grow' }, [el('div', { style: { fontWeight: '600', fontSize: '14px' } }, m.date),
-          el('small', null, (m.weightKg ? m.weightKg + ' kg' : '') + (m.weightKg && m.heightCm ? ' \u00b7 ' : '') + (m.heightCm ? m.heightCm + ' cm' : ''))]),
+      growthBox.appendChild(el('div', { class: 'row', style: { borderRadius: '10px', border: '1px solid var(--line)', marginBottom: '6px', display: 'flex', alignItems: 'center', gap: '10px', padding: '10px 12px' } }, [
+        el('div', { style: { flex: '1' } }, [el('div', { style: { fontWeight: '600', fontSize: '14px' } }, m.date),
+          el('small', { class: 'muted' }, (m.weightKg ? m.weightKg + ' kg' : '') + (m.weightKg && m.heightCm ? ' \u00b7 ' : '') + (m.heightCm ? m.heightCm + ' cm' : ''))]),
         el('button', { class: 'iconbtn', onClick: () => { measures.splice(i, 1); drawGrowth(); }, 'aria-label': 'Remove' }, '\u2715'),
       ]));
     });
@@ -883,7 +1060,7 @@ function openUserEditor(existing) {
     const name = (nameI.value || '').trim();
     if (!name) { toast('Enter a name'); return; }
     const targets = {};
-    for (const nt of NUTR) { const v = targetInputs[nt.k].value; if (v !== '' && v != null && Number.isFinite(Number(v))) targets[nt.k] = Number(v); }
+    for (const k of Object.keys(targetInputs)) { const v = targetInputs[k].value; if (v !== '' && v != null && Number.isFinite(Number(v))) targets[k] = Number(v); }
     const out = Object.assign({}, u, {
       name, dob: dobI.value || '', sex: sexSel.value, color,
       kcalTarget: kcalI.value !== '' ? parseNum(kcalI.value, null) : null,
@@ -913,7 +1090,7 @@ function openUserEditor(existing) {
   openSheet([sheetHead(isNew ? 'Add person' : 'Edit ' + (u.name || 'person')), sheetBody([
     field('Name', nameI),
     el('div', { class: 'field2' }, [field('Date of birth', dobI), field('Sex', sexSel)]),
-    field('Daily energy target (kcal)', kcalI, 'Blank = estimate from age.'),
+    field('Daily energy target (kcal)', kcalI, 'Blank = estimate from age. This is the only place to set it.'),
     field('Colour', swatches),
     el('div', { class: 'subhead' }, 'Nutrients'),
     el('div', { class: 'hint', style: { marginTop: '-4px', marginBottom: '6px' } }, 'Checkbox = show on trends. \u2B50 = bar on the day screen. \uD83D\uDED1 = treat as an upper limit (red when over). Blank target = auto by age/sex.'),
@@ -1004,8 +1181,10 @@ function openSettings() {
   drawSnaps();
 
   openSheet([sheetHead('Settings'), sheetBody([
+    el('div', { class: 'subhead', style: { marginTop: '0' } }, 'Categories'),
+    el('button', { class: 'btn ghost', onClick: openCategories }, '\uD83D\uDDC2 Edit categories (tabs)'),
     el('div', { class: 'subhead' }, 'Backup reminders'),
-    el('div', { class: 'hint', style: { marginTop: '-4px', marginBottom: '8px' } }, 'When you open Nibble after one of these times and haven\u2019t backed up that window yet, it offers a download.'),
+    el('div', { class: 'hint', style: { marginTop: '-4px', marginBottom: '8px' } }, 'When you open TrackFood after one of these times and haven\u2019t backed up that window yet, it offers a download.'),
     el('div', { class: 'field2' }, [field('Time 1', t1), field('Time 2', t2)]),
     el('button', { class: 'btn sm', onClick: async () => { await saveMeta('backupTimes', [t1.value || '06:00', t2.value || '20:00']); toast('Saved'); } }, 'Save reminder times'),
     el('div', { class: 'subhead' }, 'Backup & restore'),
@@ -1034,10 +1213,11 @@ function openMenu() {
       seclistRow('\u2795', 'Add person', () => openUserEditor(null)),
       seclistRow('\uD83D\uDCC8', 'Trends', openTrends),
       seclistRow('\uD83C\uDF7D\uFE0F', 'Manage foods', openManageFoods),
+      seclistRow('\uD83D\uDDC2', 'Categories', openCategories),
       seclistRow('\uD83D\uDCBE', 'Download backup', doDownload),
       seclistRow('\u2699\uFE0F', 'Settings', openSettings),
     ]),
-    el('div', { class: 'muted center', style: { fontSize: '12px', marginTop: '10px' } }, 'Nibble \u00b7 everything stays on this device'),
+    el('div', { class: 'muted center', style: { fontSize: '12px', marginTop: '10px' } }, 'TrackFood \u00b7 everything stays on this device'),
   ])]);
 }
 

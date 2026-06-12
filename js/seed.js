@@ -1,4 +1,4 @@
-/* ===== Nibble: built-in seed foods =====
+/* ===== TrackFood: built-in seed foods =====
    All nutrient values are per 100 g (solids) or per 100 ml (liquids),
    from CoFID / USDA typical figures. Omitted nutrients = no data.
    Serving objects: { name, grams }. "1 unit" defaults to 100 g unless set.

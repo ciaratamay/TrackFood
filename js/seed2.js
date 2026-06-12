@@ -1,4 +1,4 @@
-/* ===== Nibble: seed foods batch 2 (appended to SEED_FOODS) ===== */
+/* ===== TrackFood: seed foods batch 2 (appended to SEED_FOODS) ===== */
 'use strict';
 
 (function () {
