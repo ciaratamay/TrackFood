@@ -10,6 +10,9 @@ let curEntries = [];      /* entries for current user + date */
 let backupWindowDue = -1; /* index of a backup window that is due, or -1 */
 let undoBuffer = null;    /* last deleted entry/entries, one step of undo */
 let diaryBarsExpanded = false; /* diary nutrient bars fold-out state */
+let deferredInstallPrompt = null; /* captured Android beforeinstallprompt event */
+let installDismissed = false;     /* user tapped "Not now" this session */
+let isStandalone = false;         /* already running as an installed app */
 
 /* ---------- category helpers ---------- */
 function foodCats(f) { return Array.isArray(f.cats) ? f.cats : [f.cat || 'misc']; }
@@ -115,8 +118,39 @@ function render() {
   applyTheme(currentUser());
   app.appendChild(topBar());
   app.appendChild(userBar());
+  if (deferredInstallPrompt && !installDismissed && !isStandalone) app.appendChild(installBanner());
   if (backupWindowDue >= 0) app.appendChild(backupBanner());
   app.appendChild(el('div', { class: 'body' }, [catRail(), panel()]));
+}
+
+function installBanner() {
+  return el('div', { class: 'banner' }, [
+    el('div', null, 'Add TrackFood to your home screen'),
+    el('div', { class: 'b-actions' }, [
+      el('button', { class: 'yes', onClick: doInstall }, 'Install'),
+      el('button', { class: 'no', onClick: () => { installDismissed = true; render(); } }, 'Not now'),
+    ]),
+  ]);
+}
+async function doInstall() {
+  if (!deferredInstallPrompt) { openInstallHelp(); return; }
+  try {
+    deferredInstallPrompt.prompt();
+    await deferredInstallPrompt.userChoice;
+  } catch (e) { /* ignore */ }
+  deferredInstallPrompt = null;
+  render();
+}
+function openInstallHelp() {
+  openSheet([sheetHead('Install TrackFood'), sheetBody([
+    el('div', { class: 'muted', style: { marginTop: '0', fontSize: '13px' } }, 'TrackFood can run as an app from your home screen, fully offline. If you don\u2019t see an automatic prompt, add it manually:'),
+    el('div', { class: 'subhead' }, 'Android (Chrome)'),
+    el('div', { style: { fontSize: '14px' } }, 'Open the \u22ee menu (top-right) \u2192 \u201CAdd to Home screen\u201D or \u201CInstall app\u201D. If it only offers a plain shortcut, reload the page once and try again.'),
+    el('div', { class: 'subhead' }, 'iPhone / iPad (Safari)'),
+    el('div', { style: { fontSize: '14px' } }, 'Tap the Share button \u2192 \u201CAdd to Home Screen\u201D.'),
+    el('div', { class: 'hint', style: { marginTop: '12px' } }, 'It must be opened in your normal browser \u2014 install options don\u2019t appear inside another app\u2019s in-built browser.'),
+    el('button', { class: 'btn ghost', style: { marginTop: '14px' }, onClick: closeSheet }, 'Close'),
+  ])]);
 }
 
 function topBar() {
@@ -1559,16 +1593,18 @@ function seclistRow(emoji, label, onClick) {
 }
 function openMenu() {
   const u = currentUser();
+  const rows = [
+    seclistRow('\uD83D\uDC64', 'Edit ' + (u ? u.name : 'person'), () => openUserEditor(u)),
+    seclistRow('\u2795', 'Add person', () => openUserEditor(null)),
+    seclistRow('\uD83D\uDCC8', 'Trends', openTrends),
+    seclistRow('\uD83C\uDF7D\uFE0F', 'Manage foods', openManageFoods),
+    seclistRow('\uD83D\uDDC2', 'Categories', openCategories),
+    seclistRow('\uD83D\uDCBE', 'Download backup', doDownload),
+    seclistRow('\u2699\uFE0F', 'Settings', openSettings),
+  ];
+  if (!isStandalone) rows.push(seclistRow('\u2B07\uFE0F', 'Install app', () => doInstall()));
   openSheet([sheetHead('Menu'), sheetBody([
-    el('div', { class: 'seclist' }, [
-      seclistRow('\uD83D\uDC64', 'Edit ' + (u ? u.name : 'person'), () => openUserEditor(u)),
-      seclistRow('\u2795', 'Add person', () => openUserEditor(null)),
-      seclistRow('\uD83D\uDCC8', 'Trends', openTrends),
-      seclistRow('\uD83C\uDF7D\uFE0F', 'Manage foods', openManageFoods),
-      seclistRow('\uD83D\uDDC2', 'Categories', openCategories),
-      seclistRow('\uD83D\uDCBE', 'Download backup', doDownload),
-      seclistRow('\u2699\uFE0F', 'Settings', openSettings),
-    ]),
+    el('div', { class: 'seclist' }, rows),
     el('div', { class: 'muted center', style: { fontSize: '12px', marginTop: '10px' } }, 'TrackFood \u00b7 everything stays on this device'),
   ])]);
 }
@@ -1595,10 +1631,31 @@ async function boot() {
   }
   State.currentCat = 'diary';
   State.currentDate = todayStr();
+  isStandalone = (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) || navigator.standalone === true;
   if (navigator.storage && navigator.storage.persist) { try { await navigator.storage.persist(); } catch (e) {} }
-  if ('serviceWorker' in navigator) { try { navigator.serviceWorker.register('sw.js'); } catch (e) {} }
+  if ('serviceWorker' in navigator) {
+    /* register after load so it doesn't compete with first paint; log failures
+       (a failed SW is the usual reason Android won't offer "Install app") */
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('sw.js').catch((err) => console.warn('Service worker registration failed:', err));
+    });
+  }
   try { await autoSnapshot(); } catch (e) {}
   backupWindowDue = shouldPromptBackup();
   await rerender();
+}
+/* Capture Android's install prompt so we can offer our own Install button,
+   and hide install UI once installed. */
+if (typeof window !== 'undefined') {
+  window.addEventListener('beforeinstallprompt', (e) => {
+    e.preventDefault();
+    deferredInstallPrompt = e;
+    if (document.querySelector('#app') && document.querySelector('#app').childNodes.length) render();
+  });
+  window.addEventListener('appinstalled', () => {
+    deferredInstallPrompt = null;
+    isStandalone = true;
+    if (document.querySelector('#app')) render();
+  });
 }
 boot();
