@@ -30,6 +30,56 @@ function catInfoOf(k) {
 
 /* ---------- small helpers ---------- */
 function userColor(u, idx) { return u.color || USER_COLORS[idx % USER_COLORS.length]; }
+
+/* ---------- colour theming ---------- */
+function hex2rgb(h) { h = h.replace('#', ''); return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)]; }
+function rgb2hex(r, g, b) { const f = x => ('0' + Math.max(0, Math.min(255, Math.round(x))).toString(16)).slice(-2); return '#' + f(r) + f(g) + f(b); }
+function mixHex(hex, withHex, t) { const a = hex2rgb(hex), b = hex2rgb(withHex); return rgb2hex(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t); }
+/* selected person's colour -> accent; pale tints -> soft fills and the panel background */
+function applyTheme(u) {
+  const c = (u && u.color) || USER_COLORS[0];
+  const r = document.documentElement.style;
+  r.setProperty('--accent', c);
+  r.setProperty('--accent-deep', mixHex(c, '#000000', 0.18));
+  r.setProperty('--accent-soft', mixHex(c, '#FFFFFF', 0.86));
+  r.setProperty('--bg', mixHex(c, '#FFFFFF', 0.93));
+}
+
+/* ---------- drag-to-reorder (pointer-based, touch friendly) ----------
+   Rows carry data-key and a .draghandle. onDone(orderedKeys) fires on release. */
+function dragReorder(listEl, onDone) {
+  let dragging = null;
+  function begin(e, row) {
+    dragging = row;
+    row.classList.add('dragging');
+    try { listEl.setPointerCapture(e.pointerId); } catch (_) {}
+    e.preventDefault();
+  }
+  listEl.querySelectorAll('.draghandle').forEach(h => {
+    const row = h.closest('[data-key]');
+    h.addEventListener('pointerdown', (e) => begin(e, row));
+  });
+  listEl.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    e.preventDefault();
+    const others = Array.from(listEl.querySelectorAll('[data-key]')).filter(r => r !== dragging);
+    let placed = false;
+    for (const r of others) {
+      const rect = r.getBoundingClientRect();
+      if (e.clientY < rect.top + rect.height / 2) { listEl.insertBefore(dragging, r); placed = true; break; }
+    }
+    if (!placed) listEl.appendChild(dragging);
+  });
+  function end() {
+    if (!dragging) return;
+    dragging.classList.remove('dragging');
+    dragging = null;
+    if (onDone) onDone(Array.from(listEl.querySelectorAll('[data-key]')).map(r => r.getAttribute('data-key')));
+  }
+  listEl.addEventListener('pointerup', end);
+  listEl.addEventListener('pointercancel', end);
+}
+
 function isLimitFor(key, u) { return (u.limits || []).includes(key); }
 function formatQty(q) {
   if (q == null) return '';
@@ -61,6 +111,7 @@ async function rerender() {
 function render() {
   const app = $('#app');
   clear(app);
+  applyTheme(currentUser());
   app.appendChild(topBar());
   app.appendChild(userBar());
   if (backupWindowDue >= 0) app.appendChild(backupBanner());
@@ -126,11 +177,13 @@ function panel() {
   p.appendChild(dateStrip());
   const cur = State.currentCat;
   if (cur === 'diary') {
-    p.appendChild(barsBlock());
+    p.appendChild(barsBlock(null));               /* diary: every starred nutrient */
     p.appendChild(el('div', { class: 'scroll' }, diaryList()));
   } else if (CAT_BY_KEY[cur] && CAT_BY_KEY[cur].grouped) {
+    p.appendChild(barsBlock(5));                   /* food tabs: top 5 only */
     p.appendChild(el('div', { class: 'scroll' }, saucesPanel()));
   } else {
+    p.appendChild(barsBlock(5));
     p.appendChild(el('div', { class: 'scroll' }, foodGrid(cur)));
   }
   return p;
@@ -176,16 +229,19 @@ function nutrientBar(key, value, target, isLimit, onTap) {
   return bar;
 }
 
-function barsBlock() {
+function barsBlock(limit) {
   const u = currentUser();
-  const starred = (u.starred && u.starred.length) ? u.starred : DEFAULT_STARRED;
+  let starred = (u.starred && u.starred.length) ? u.starred.slice() : DEFAULT_STARRED.slice();
+  starred = starred.filter(k => NUTR_BY_KEY[k]);
+  if (limit != null) starred = starred.slice(0, limit);
   if (!curEntries.length) {
+    /* On food tabs, keep it quiet so the food grid stays the focus. */
+    if (limit != null) return el('div', { class: 'bars empty' }, 'Nothing logged yet today.');
     return el('div', { class: 'bars empty' }, 'No food logged yet for this day. Pick a category on the left to start.');
   }
   const totals = totalsFor(curEntries);
   const block = el('div', { class: 'bars' });
   starred.forEach(key => {
-    if (!NUTR_BY_KEY[key]) return;
     const val = totals[key] || 0;
     const t = targetFor(key, u);
     block.appendChild(nutrientBar(key, val, t, isLimitFor(key, u), () => openNutrientDetail(key)));
@@ -829,51 +885,174 @@ function mapOff(nutriments) {
 }
 /* Two endpoints: the new Search-a-licious API (CORS-friendly), then the
    classic cgi search as a fallback. */
-async function offQuery(q) {
+/* country name -> Open Food Facts tag, e.g. "United Kingdom" -> "en:united-kingdom" */
+function countryTag(name) { return 'en:' + String(name).toLowerCase().replace(/\s+/g, '-'); }
+/* OFF brand search, optionally restricted to one or more countries.
+   countries: array of country names (e.g. ['United Kingdom','Ireland']) or empty for worldwide. */
+async function offQuery(q, countries) {
   const fields = 'product_name,brands,nutriments';
+  const list = countries || [];
+  /* Search-a-licious: combine free text with a country filter clause in q */
+  let qExpr = q;
+  if (list.length) qExpr = q + ' (' + list.map(c => 'countries_tags:' + countryTag(c)).join(' OR ') + ')';
   try {
-    const r = await fetch('https://search.openfoodfacts.org/search?q=' + encodeURIComponent(q) +
+    const r = await fetch('https://search.openfoodfacts.org/search?q=' + encodeURIComponent(qExpr) +
       '&page_size=20&fields=' + fields);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const data = await r.json();
     const hits = data.hits || data.products || [];
     if (hits.length) return hits;
   } catch (e) { /* fall through to legacy endpoint */ }
-  const r2 = await fetch('https://world.openfoodfacts.org/cgi/search.pl?search_terms=' + encodeURIComponent(q) +
-    '&search_simple=1&action=process&json=1&page_size=20&fields=' + fields);
+  /* Legacy cgi search: supports full text + a single country tag filter only */
+  let url2 = 'https://world.openfoodfacts.org/cgi/search.pl?search_terms=' + encodeURIComponent(q) +
+    '&search_simple=1&action=process&json=1&page_size=20&fields=' + fields;
+  if (list.length === 1) url2 += '&tagtype_0=countries&tag_contains_0=contains&tag_0=' + encodeURIComponent(list[0]);
+  const r2 = await fetch(url2);
   if (!r2.ok) throw new Error('HTTP ' + r2.status);
   const data2 = await r2.json();
   return data2.products || [];
 }
+/* USDA FoodData Central: generic whole foods (Foundation / SR Legacy / Survey),
+   which Open Food Facts (a branded-product database) lacks. Free key in Settings;
+   without one it falls back to DEMO_KEY (30 requests/hour). */
+const FDC_MAP = { 1008:'kcal',1003:'protein',1005:'carbs',1004:'fat',1258:'satfat',1292:'monofat',1293:'polyfat',
+  1253:'chol',2000:'sugar',1063:'sugar',1079:'fiber',1106:'vita',1165:'b1',1166:'b2',1167:'b3',1170:'b5',
+  1175:'b6',1177:'b9',1190:'b9',1178:'b12',1162:'c',1114:'d',1109:'e',1185:'vitk',1180:'choline',
+  1087:'calcium',1089:'iron',1090:'magnesium',1095:'zinc',1092:'potassium',1093:'sodium',1091:'phosphorus',
+  1098:'copper',1101:'manganese',1103:'selenium',1100:'iodine' };
+const UNIT_TO_G = { G:1, MG:1e-3, UG:1e-6 };
+const OUR_TO_G = { 'g':1, 'mg':1e-3, '\u00b5g':1e-6 };
+function mapFdc(foodNutrients) {
+  const n = {};
+  for (const fn of (foodNutrients || [])) {
+    const id = fn.nutrientId || (fn.nutrient && fn.nutrient.id) || parseInt(fn.nutrientNumber, 10);
+    const our = FDC_MAP[id];
+    if (!our || n[our] != null) continue;
+    const val = (fn.value != null ? fn.value : fn.amount);
+    if (val == null || !Number.isFinite(Number(val))) continue;
+    const unit = String(fn.unitName || '').toUpperCase();
+    if (our === 'kcal') { if (unit === 'KCAL') n[our] = Math.round(Number(val)); continue; }
+    const ourUnit = NUTR_BY_KEY[our] && NUTR_BY_KEY[our].unit;
+    const fg = UNIT_TO_G[unit], og = OUR_TO_G[ourUnit];
+    if (fg == null || og == null) continue;
+    n[our] = Math.round(Number(val) * fg / og * 1000) / 1000;
+  }
+  return n;
+}
+function fdcKey() { return (State.meta && State.meta.fdcApiKey) ? State.meta.fdcApiKey : 'DEMO_KEY'; }
+async function fdcQuery(q) {
+  const types = encodeURIComponent('Foundation,SR Legacy,Survey (FNDDS)');
+  const url = 'https://api.nal.usda.gov/fdc/v1/foods/search?api_key=' + encodeURIComponent(fdcKey()) +
+    '&query=' + encodeURIComponent(q) + '&pageSize=25&dataType=' + types;
+  const r = await fetch(url);
+  if (!r.ok) {
+    if (r.status === 429) throw new Error('USDA rate limit reached \u2014 add a free key in Settings');
+    if (r.status === 403) throw new Error('USDA key rejected \u2014 check it in Settings');
+    throw new Error('HTTP ' + r.status);
+  }
+  const data = await r.json();
+  return data.foods || [];
+}
+
+/* Online search with a source toggle: USDA whole foods or Open Food Facts brands. */
+/* European countries (OFF tags products by where they're SOLD, so Italian brands
+   sold in Ireland are tagged Ireland; including Italy also catches Italy-only items). */
+const EUROPE = ['Ireland','United Kingdom','Italy','France','Spain','Germany','Portugal',
+  'Netherlands','Belgium','Austria','Poland','Greece','Sweden','Denmark','Finland','Czechia',
+  'Hungary','Romania','Bulgaria','Croatia','Slovakia','Slovenia','Lithuania','Latvia','Estonia',
+  'Luxembourg','Malta','Cyprus','Norway','Switzerland','Iceland'];
+const EU_MAINLAND = EUROPE.filter(c => c !== 'Ireland' && c !== 'United Kingdom');
+/* single-country options offered in the dropdown — full world list, alphabetical */
+const COUNTRY_LIST = Array.from(new Set(EUROPE.concat([
+  'Argentina','Australia','Bangladesh','Brazil','Canada','Chile','China','Colombia','Egypt',
+  'India','Indonesia','Israel','Japan','Kenya','Malaysia','Mexico','Morocco','New Zealand',
+  'Nigeria','Pakistan','Peru','Philippines','Russia','Saudi Arabia','Singapore','South Africa',
+  'South Korea','Thailand','Turkey','Ukraine','United Arab Emirates','United States','Vietnam',
+]))).sort();
+const OFF_SCOPES = {
+  ie_uk_eu: { label: 'Ireland, UK & Europe', countries: EUROPE },
+  ie:       { label: 'Ireland only',         countries: ['Ireland'] },
+  ie_uk:    { label: 'Ireland & UK',         countries: ['Ireland', 'United Kingdom'] },
+  eu_main:  { label: 'Mainland Europe (excl. UK & IE)', countries: EU_MAINLAND },
+  world:    { label: 'Worldwide',            countries: [] },
+};
+/* resolve a stored scope value (a key, or "country:Italy") to {label, countries} */
+function resolveScope(val) {
+  if (val && val.indexOf('country:') === 0) { const c = val.slice(8); return { label: c, countries: [c] }; }
+  return OFF_SCOPES[val] || OFF_SCOPES.ie_uk_eu;
+}
 function openOffSearch(cat) {
-  const input = el('input', { class: 'search', type: 'search', placeholder: 'Search products online\u2026' });
+  let source = 'usda'; /* default to whole foods, since that's the common gap */
+  let scope = (State.meta && State.meta.offScope) ? State.meta.offScope : 'ie_uk_eu';
+  const input = el('input', { class: 'search', type: 'search', placeholder: 'Search foods online\u2026' });
   const results = el('div', { class: 'servlist' });
   const status = el('div', { class: 'muted', style: { fontSize: '13px', padding: '4px 0' } });
+
+  const pills = el('div', { class: 'pillrow' });
+  function setSource(s, btn) { source = s; Array.from(pills.children).forEach(x => x.classList.remove('sel')); btn.classList.add('sel'); regionRow.style.display = (s === 'off') ? 'block' : 'none'; }
+  const pUsda = el('button', { class: 'sel' }, 'Whole foods (USDA)');
+  const pOff = el('button', null, 'Brands (Open Food Facts)');
+  pUsda.addEventListener('click', () => { setSource('usda', pUsda); run(); });
+  pOff.addEventListener('click', () => { setSource('off', pOff); run(); });
+  pills.append(pUsda, pOff);
+
+  /* region dropdown — only relevant for branded (OFF) results, defaults to a broad scope
+     so the common case needs no interaction; brand text does the fine targeting. */
+  const regionRow = el('div', { style: { display: 'none', marginBottom: '10px' } });
+  const scopeSel = el('select', { style: { width: '100%', padding: '11px 13px', border: '1px solid var(--line)', borderRadius: '11px', background: 'var(--surface)' } });
+  const gScope = el('optgroup', { label: 'Scope' });
+  Object.keys(OFF_SCOPES).forEach(k => gScope.appendChild(el('option', { value: k }, OFF_SCOPES[k].label)));
+  const gCountry = el('optgroup', { label: 'Single country' });
+  COUNTRY_LIST.forEach(c => gCountry.appendChild(el('option', { value: 'country:' + c }, c)));
+  scopeSel.append(gScope, gCountry);
+  scopeSel.value = scope;
+  scopeSel.addEventListener('change', () => { scope = scopeSel.value; saveMeta('offScope', scope); if (source === 'off') run(); });
+  regionRow.append(el('label', { class: 'fieldlbl' }, 'Region'), scopeSel);
+
+  function addFood(name, n, brand) {
+    const food = canonicalizeFood({ id: uid('f_'), name: name, emoji: '\uD83C\uDF7D\uFE0F',
+      cats: [cat || 'misc'], per: 'g', n: n, servings: [{ name: '100 g', grams: 100 }],
+      src: source === 'usda' ? 'usda' : 'off', uses: 0, lastUsed: 0 });
+    (async () => { await saveFood(food); toast('Added \u2014 long-press to edit categories or servings'); await rerender(); openServingSheet(food); })();
+  }
   async function run() {
     const q = (input.value || '').trim();
     if (!q) return;
     status.textContent = 'Searching\u2026'; clear(results);
     try {
-      const prods = (await offQuery(q)).filter(p => p.product_name && p.nutriments);
-      status.textContent = prods.length ? '' : 'No results. Try different words, or add the food manually.';
-      prods.forEach(p => {
-        const nm = p.product_name + (p.brands ? (' \u00b7 ' + String(p.brands).split(',')[0]) : '');
-        results.appendChild(el('div', { class: 'servopt', onClick: () => {
+      if (source === 'usda') {
+        const foods = await fdcQuery(q);
+        const rows = foods.filter(f => f.description);
+        status.textContent = rows.length ? '' : 'No results. Try simpler words (e.g. \u201Calmonds\u201D), or switch to Brands.';
+        rows.forEach(f => {
+          const n = mapFdc(f.foodNutrients);
+          const tag = (f.dataType || '').replace('Survey (FNDDS)', 'survey');
+          results.appendChild(el('div', { class: 'servopt', onClick: () => addFood(titleCase(f.description), n, '') }, [
+            el('span', null, titleCase(f.description)),
+            el('span', { class: 'g' }, (n.kcal != null ? n.kcal + ' kcal/100g' : '') + (tag ? '  \u00b7 ' + tag.toLowerCase() : '')),
+          ]));
+        });
+      } else {
+        const sc = resolveScope(scope);
+        const prods = (await offQuery(q, sc.countries)).filter(p => p.product_name && p.nutriments);
+        status.textContent = prods.length ? '' : 'No results in ' + sc.label + '. Try a wider region, different words, or the Whole foods source.';
+        prods.forEach(p => {
+          const nm = p.product_name + (p.brands ? (' \u00b7 ' + String(p.brands).split(',')[0]) : '');
           const n = mapOff(p.nutriments);
-          const food = canonicalizeFood({ id: uid('f_'), name: p.product_name, emoji: '\uD83C\uDF7D\uFE0F',
-            cats: [cat || 'misc'], per: 'g', n, servings: [{ name: '100 g', grams: 100 }],
-            src: 'off', uses: 0, lastUsed: 0 });
-          (async () => { await saveFood(food); toast('Added \u2014 long-press it to edit categories or servings'); await rerender(); openServingSheet(food); })();
-        } }, [el('span', null, nm), el('span', { class: 'g' }, (p.nutriments['energy-kcal_100g'] != null ? Math.round(p.nutriments['energy-kcal_100g']) + ' kcal/100g' : ''))]));
-      });
+          results.appendChild(el('div', { class: 'servopt', onClick: () => addFood(p.product_name, n, p.brands) }, [
+            el('span', null, nm),
+            el('span', { class: 'g' }, (p.nutriments['energy-kcal_100g'] != null ? Math.round(p.nutriments['energy-kcal_100g']) + ' kcal/100g' : '')),
+          ]));
+        });
+      }
     } catch (e) {
-      status.textContent = 'Search failed (' + (e.message || 'network error') + '). If this keeps happening the food database may be temporarily down \u2014 you can add the food manually instead.';
+      status.textContent = 'Search failed (' + (e.message || 'network error') + '). The other source may work, or add the food manually.';
     }
   }
   input.addEventListener('keydown', e => { if (e.key === 'Enter') run(); });
   openSheet([sheetHead('Search online'), sheetBody([
-    el('div', { class: 'muted', style: { marginTop: '0', fontSize: '13px' } }, 'Looks up Open Food Facts. Values land per 100 g \u2014 check them and set a serving before logging.'),
-    input,
+    el('div', { class: 'muted', style: { marginTop: '0', fontSize: '13px' } }, 'USDA = generic whole foods (raw almonds, carrots\u2026). Brands = packaged products. The region just bounds where products are sold \u2014 a brand name like \u201CMutti\u201D still finds the right one. Values land per 100 g \u2014 check them and set a serving before logging.'),
+    pills, regionRow, input,
     el('button', { class: 'btn ghost sm', onClick: run }, 'Search'),
     status, results,
   ])]);
@@ -986,9 +1165,8 @@ function openUserEditor(existing) {
   const dobI = el('input', { type: 'date', value: u.dob || '', style: { width: '100%', padding: '11px 13px', border: '1px solid var(--line)', borderRadius: '11px', background: 'var(--surface)' } });
   const sexSel = el('select', null, [el('option', { value: 'm' }, 'Male'), el('option', { value: 'f' }, 'Female')]);
   sexSel.value = u.sex || 'm';
-  const kcalI = numInput({ value: (u.kcalTarget != null ? u.kcalTarget : ''), step: '10', min: '0', placeholder: 'auto by age' });
 
-  /* colour swatches */
+  /* colour swatches: chosen colour themes the whole app while this person is selected */
   let color = u.color || USER_COLORS[0];
   const swatches = el('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap' } });
   USER_COLORS.forEach(col => {
@@ -997,36 +1175,77 @@ function openUserEditor(existing) {
     swatches.appendChild(sw);
   });
 
-  /* nutrient settings table — energy lives in the field above, so skip kcal here */
+  /* state for the nutrient table */
   const shown = new Set(u.shown && u.shown.length ? u.shown : DEFAULT_SHOWN);
-  const starred = new Set(u.starred && u.starred.length ? u.starred : DEFAULT_STARRED);
   const limits = new Set(u.limits && u.limits.length ? u.limits : DEFAULT_LIMITS);
+  const starredSet = new Set();
+  let starOrder = (u.starred && u.starred.length ? u.starred : DEFAULT_STARRED).filter(k => NUTR_BY_KEY[k]);
+  starOrder.forEach(k => starredSet.add(k));
   const targetInputs = {};
+
+  /* current energy target (kcal row drives macro % defaults live) */
+  function curKcal() {
+    if (targetInputs.kcal && targetInputs.kcal.value !== '') { const v = parseNum(targetInputs.kcal.value, null); if (v != null) return v; }
+    return u.kcalTarget || null;
+  }
+
+  /* --- bar order (drag to reorder) --- */
+  const orderBox = el('div', { class: 'reorder-list' });
+  function drawOrder() {
+    clear(orderBox);
+    if (!starOrder.length) {
+      orderBox.appendChild(el('div', { class: 'muted', style: { fontSize: '13px', padding: '2px 0' } }, 'Star nutrients in the list below to add them as bars. They appear in this order \u2014 the top 5 also show on each food tab.'));
+      return;
+    }
+    starOrder.forEach((k, i) => {
+      orderBox.appendChild(el('div', { class: 'reorder-row', 'data-key': k }, [
+        el('span', { class: 'draghandle' }, '\u2630'),
+        el('span', { class: 'idx' }, String(i + 1)),
+        el('span', { class: 'nm' }, labelOf(k)),
+        el('span', { class: 'u' }, unitOf(k)),
+      ]));
+    });
+    dragReorder(orderBox, (newOrder) => { starOrder = newOrder; relabelOrder(); });
+  }
+  /* update the visible position numbers without a full redraw (keeps drag smooth) */
+  function relabelOrder() {
+    Array.from(orderBox.querySelectorAll('.reorder-row')).forEach((row, i) => {
+      const idx = row.querySelector('.idx'); if (idx) idx.textContent = String(i + 1);
+    });
+  }
+  function toggleStar(k) {
+    if (starredSet.has(k)) { starredSet.delete(k); starOrder = starOrder.filter(x => x !== k); }
+    else { starredSet.add(k); starOrder.push(k); }
+    drawOrder();
+  }
+
+  /* --- nutrient table (kcal included; its target is the single energy goal) --- */
   const nutrTable = el('div');
   NUTR.forEach(nt => {
-    if (nt.k === 'kcal') return; /* single source of truth: the energy field above */
-    const draft = { dob: dobI.value, sex: sexSel.value, kcalTarget: parseNum(kcalI.value, null), targets: u.targets || {} };
+    const draft = { dob: dobI.value, sex: sexSel.value, kcalTarget: curKcal(), targets: u.targets || {} };
     const def = defaultTarget(nt.k, draft);
     const tgt = el('input', { class: 'tgt num', type: 'number', step: 'any', min: '0',
       value: (u.targets && u.targets[nt.k] != null ? u.targets[nt.k] : ''), placeholder: (def != null ? String(def) : '\u2014') });
     targetInputs[nt.k] = tgt;
     const showCb = el('input', { type: 'checkbox', checked: shown.has(nt.k) });
     showCb.addEventListener('change', () => { showCb.checked ? shown.add(nt.k) : shown.delete(nt.k); });
-    const starBtn = el('button', { class: 'toggle ' + (starred.has(nt.k) ? 'on' : 'off') }, '\u2B50');
-    starBtn.addEventListener('click', () => { starred.has(nt.k) ? starred.delete(nt.k) : starred.add(nt.k); starBtn.className = 'toggle ' + (starred.has(nt.k) ? 'on' : 'off'); });
+    const starBtn = el('button', { class: 'toggle ' + (starredSet.has(nt.k) ? 'on' : 'off') }, '\u2B50');
+    starBtn.addEventListener('click', () => { toggleStar(nt.k); starBtn.className = 'toggle ' + (starredSet.has(nt.k) ? 'on' : 'off'); });
     const limBtn = el('button', { class: 'toggle ' + (limits.has(nt.k) ? 'on' : 'off') }, '\uD83D\uDED1');
     limBtn.addEventListener('click', () => { limits.has(nt.k) ? limits.delete(nt.k) : limits.add(nt.k); limBtn.className = 'toggle ' + (limits.has(nt.k) ? 'on' : 'off'); });
 
     nutrTable.appendChild(el('div', { class: 'nutr-row' }, [
-      el('div', { class: 'name' }, [nt.label, el('div', { class: 'hint' }, nt.unit)]),
+      el('div', { class: 'name' }, [nt.label + (nt.k === 'kcal' ? ' (energy goal)' : ''), el('div', { class: 'hint' }, nt.unit)]),
       el('label', { class: 'check', title: 'Show on trends' }, [showCb]),
       starBtn, limBtn,
     ]));
     nutrTable.appendChild(el('div', { class: 'field2', style: { margin: '0 0 6px 2px', alignItems: 'center' } }, [
-      el('div', { class: 'muted', style: { fontSize: '11px', flex: '1' } }, 'target / limit'),
+      el('div', { class: 'muted', style: { fontSize: '11px', flex: '1' } }, nt.k === 'kcal' ? 'daily energy target' : 'target / limit'),
       el('div', { style: { flex: '0 0 90px' } }, tgt),
     ]));
   });
+
+  drawOrder();
 
   /* growth log */
   let measures = (u.measures || []).slice().sort((a, b) => (a.date < b.date ? 1 : -1));
@@ -1063,10 +1282,11 @@ function openUserEditor(existing) {
     for (const k of Object.keys(targetInputs)) { const v = targetInputs[k].value; if (v !== '' && v != null && Number.isFinite(Number(v))) targets[k] = Number(v); }
     const out = Object.assign({}, u, {
       name, dob: dobI.value || '', sex: sexSel.value, color,
-      kcalTarget: kcalI.value !== '' ? parseNum(kcalI.value, null) : null,
+      /* keep kcalTarget in sync so macro %-of-energy defaults follow the chosen goal */
+      kcalTarget: targets.kcal != null ? targets.kcal : null,
       targets,
       shown: NUTR.filter(nt => shown.has(nt.k)).map(nt => nt.k),
-      starred: NUTR.filter(nt => starred.has(nt.k)).map(nt => nt.k),
+      starred: starOrder.slice(),                 /* preserve the dragged order */
       limits: NUTR.filter(nt => limits.has(nt.k)).map(nt => nt.k),
       measures,
     });
@@ -1090,10 +1310,12 @@ function openUserEditor(existing) {
   openSheet([sheetHead(isNew ? 'Add person' : 'Edit ' + (u.name || 'person')), sheetBody([
     field('Name', nameI),
     el('div', { class: 'field2' }, [field('Date of birth', dobI), field('Sex', sexSel)]),
-    field('Daily energy target (kcal)', kcalI, 'Blank = estimate from age. This is the only place to set it.'),
     field('Colour', swatches),
+    el('div', { class: 'hint', style: { marginTop: '-6px', marginBottom: '4px' } }, 'This colour themes the app while this person is selected.'),
+    el('div', { class: 'subhead' }, 'Bar order'),
+    orderBox,
     el('div', { class: 'subhead' }, 'Nutrients'),
-    el('div', { class: 'hint', style: { marginTop: '-4px', marginBottom: '6px' } }, 'Checkbox = show on trends. \u2B50 = bar on the day screen. \uD83D\uDED1 = treat as an upper limit (red when over). Blank target = auto by age/sex.'),
+    el('div', { class: 'hint', style: { marginTop: '-4px', marginBottom: '6px' } }, 'Checkbox = show on trends. \u2B50 = bar on the day & food screens. \uD83D\uDED1 = treat as an upper limit (red when over). Set the energy goal on the Energy row. Blank target = auto by age/sex.'),
     nutrTable,
     el('div', { class: 'subhead' }, 'Growth log'),
     growthBox,
@@ -1142,6 +1364,7 @@ function openTrends() {
 function timeStyleObj() { return { width: '100%', padding: '11px 13px', border: '1px solid var(--line)', borderRadius: '11px', background: 'var(--surface)' }; }
 function openSettings() {
   const times = (State.meta.backupTimes || ['06:00', '20:00']).slice();
+  const fdcKeyInp = textInput({ value: (State.meta.fdcApiKey || ''), placeholder: 'DEMO_KEY (default)' });
   const t1 = el('input', { type: 'time', value: times[0] || '06:00', style: timeStyleObj() });
   const t2 = el('input', { type: 'time', value: times[1] || '20:00', style: timeStyleObj() });
   const fileInp = el('input', { type: 'file', accept: 'application/json,.json', style: { display: 'none' } });
@@ -1183,6 +1406,10 @@ function openSettings() {
   openSheet([sheetHead('Settings'), sheetBody([
     el('div', { class: 'subhead', style: { marginTop: '0' } }, 'Categories'),
     el('button', { class: 'btn ghost', onClick: openCategories }, '\uD83D\uDDC2 Edit categories (tabs)'),
+    el('div', { class: 'subhead' }, 'Online search (USDA key)'),
+    el('div', { class: 'hint', style: { marginTop: '-4px', marginBottom: '8px' } }, 'Optional. A free USDA FoodData Central key lifts whole-food search from 30 to 1,000 lookups/hour. Get one at fdc.nal.usda.gov/api-key-signup, then paste it here.'),
+    field('USDA API key', fdcKeyInp),
+    el('button', { class: 'btn sm', onClick: async () => { await saveMeta('fdcApiKey', (fdcKeyInp.value || '').trim()); toast('Saved'); } }, 'Save key'),
     el('div', { class: 'subhead' }, 'Backup reminders'),
     el('div', { class: 'hint', style: { marginTop: '-4px', marginBottom: '8px' } }, 'When you open TrackFood after one of these times and haven\u2019t backed up that window yet, it offers a download.'),
     el('div', { class: 'field2' }, [field('Time 1', t1), field('Time 2', t2)]),

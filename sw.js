@@ -3,7 +3,7 @@
    phones pick up the new version. */
 'use strict';
 
-const CACHE_VERSION = 'trackfood-v2';
+const CACHE_VERSION = 'trackfood-v5';
 const SHELL = [
   './',
   './index.html',

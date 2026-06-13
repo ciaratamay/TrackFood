@@ -53,6 +53,11 @@ function valWithUnit(key, value) {
   return nVal(key, value) + (u === 'kcal' ? ' kcal' : ' ' + u);
 }
 
+/* Title-case a description like "ALMONDS, RAW" or "nuts, almonds" -> "Almonds, Raw". */
+function titleCase(str) {
+  return String(str || '').toLowerCase().replace(/\b([a-z])/g, (m, c) => c.toUpperCase());
+}
+
 /* ---------- toast ---------- */
 let _toastTimer = null;
 function toast(msg, ms) {
