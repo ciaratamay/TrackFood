@@ -9,6 +9,7 @@ const SEG_COLORS = ['#0E9F6E','#6E8FC9','#C97B4B','#9A78C4','#C95C7E','#3FA8A0',
 let curEntries = [];      /* entries for current user + date */
 let backupWindowDue = -1; /* index of a backup window that is due, or -1 */
 let undoBuffer = null;    /* last deleted entry/entries, one step of undo */
+let diaryBarsExpanded = false; /* diary nutrient bars fold-out state */
 
 /* ---------- category helpers ---------- */
 function foodCats(f) { return Array.isArray(f.cats) ? f.cats : [f.cat || 'misc']; }
@@ -233,19 +234,29 @@ function barsBlock(limit) {
   const u = currentUser();
   let starred = (u.starred && u.starred.length) ? u.starred.slice() : DEFAULT_STARRED.slice();
   starred = starred.filter(k => NUTR_BY_KEY[k]);
-  if (limit != null) starred = starred.slice(0, limit);
+  const isDiary = (limit == null);
   if (!curEntries.length) {
-    /* On food tabs, keep it quiet so the food grid stays the focus. */
-    if (limit != null) return el('div', { class: 'bars empty' }, 'Nothing logged yet today.');
+    if (!isDiary) return el('div', { class: 'bars empty' }, 'Nothing logged yet today.');
     return el('div', { class: 'bars empty' }, 'No food logged yet for this day. Pick a category on the left to start.');
   }
   const totals = totalsFor(curEntries);
+  /* Diary shows the top few by default with a fold-out for the rest, so the
+     food list stays in view. Food tabs always show the fixed top 5. */
+  const COLLAPSED = 5;
+  let list = starred;
+  if (!isDiary) list = starred.slice(0, limit);
+  else if (!diaryBarsExpanded) list = starred.slice(0, COLLAPSED);
   const block = el('div', { class: 'bars' });
-  starred.forEach(key => {
+  list.forEach(key => {
     const val = totals[key] || 0;
     const t = targetFor(key, u);
     block.appendChild(nutrientBar(key, val, t, isLimitFor(key, u), () => openNutrientDetail(key)));
   });
+  if (isDiary && starred.length > COLLAPSED) {
+    const hidden = starred.length - COLLAPSED;
+    block.appendChild(el('button', { class: 'morebtn', onClick: () => { diaryBarsExpanded = !diaryBarsExpanded; render(); } },
+      diaryBarsExpanded ? 'Show less' : ('\uFF0B ' + hidden + ' more')));
+  }
   return block;
 }
 
@@ -329,24 +340,50 @@ function foodGrid(cat) {
   const wrap = el('div', { class: 'grid-wrap' });
   const pinned = el('div', { class: 'pinned' }, standardPins(cat));
   const info = catInfoOf(cat);
-  const tiles = el('div', { class: 'tiles' });
+  const body = el('div');
   const search = el('input', { class: 'search', type: 'search', placeholder: 'Search ' + info.label.toLowerCase() + '\u2026',
-    oninput: () => renderTiles(search.value) });
+    oninput: () => renderBody(search.value) });
 
-  function listFor(filter) {
+  const wasLogged = (f) => (f.lastUsed || 0) > 0 || (f.uses || 0) > 0;
+  const byRecency = (a, b) => (b.lastUsed || 0) - (a.lastUsed || 0) || (b.uses || 0) - (a.uses || 0) || a.name.localeCompare(b.name);
+  const byName = (a, b) => a.name.localeCompare(b.name);
+
+  function tilesOf(list) {
+    const t = el('div', { class: 'tiles' });
+    list.forEach(f => t.appendChild(foodTile(f)));
+    return t;
+  }
+
+  function renderBody(filter) {
+    clear(body);
     let list = State.foods.filter(f => foodInCat(f, cat));
-    if (filter) { const q = filter.toLowerCase(); list = list.filter(f => f.name.toLowerCase().includes(q)); }
-    list.sort((a, b) => (b.uses || 0) - (a.uses || 0) || a.name.localeCompare(b.name));
-    return list;
+    if (filter) {
+      /* while searching, show one flat list (most-used/recent first) */
+      const q = filter.toLowerCase();
+      list = list.filter(f => f.name.toLowerCase().includes(q)).sort(byRecency);
+      if (!list.length) { body.appendChild(el('div', { class: 'tiles-empty' }, 'No matches.')); return; }
+      body.appendChild(tilesOf(list));
+      return;
+    }
+    if (!list.length) {
+      body.appendChild(el('div', { class: 'tiles-empty' }, 'No foods here yet. Tap \u201CAdd food\u201D to create one, or long-press any food elsewhere to edit its categories.'));
+      return;
+    }
+    /* logged-before foods up top (most recent first), then a divider, then the rest */
+    const used = list.filter(wasLogged).sort(byRecency);
+    const rest = list.filter(f => !wasLogged(f)).sort(byName);
+    if (used.length) {
+      body.appendChild(el('div', { class: 'grouphead' }, 'Recently logged'));
+      body.appendChild(tilesOf(used));
+    }
+    if (rest.length) {
+      if (used.length) body.appendChild(el('div', { class: 'griddivider' }));
+      body.appendChild(el('div', { class: 'grouphead' }, used.length ? ('More ' + info.label.toLowerCase()) : info.label));
+      body.appendChild(tilesOf(rest));
+    }
   }
-  function renderTiles(filter) {
-    clear(tiles);
-    const list = listFor(filter);
-    if (!list.length) { tiles.appendChild(el('div', { class: 'tiles-empty' }, 'No foods here yet. Tap \u201CAdd food\u201D to create one, or long-press any food elsewhere to edit its categories.')); return; }
-    list.forEach(f => tiles.appendChild(foodTile(f)));
-  }
-  renderTiles('');
-  wrap.append(pinned, search, tiles);
+  renderBody('');
+  wrap.append(pinned, search, body);
   return wrap;
 }
 
@@ -598,6 +635,30 @@ function checkGroup(items, selected) {
 }
 
 /* ---------- custom food editor ---------- */
+/* ---------- servings ----------
+   New foods (custom, imported, online) get standard handy servings so you don't
+   have to look up a weight every time: 100 g/ml, 1 tbsp (~15), 1 tsp (~5),
+   plus whatever the source already specifies. The 247 built-in foods keep their
+   own realistic servings (1 apple, 1 slice, etc.) untouched. */
+function standardServings(per) {
+  const u = (per === 'ml') ? 'ml' : 'g';
+  return [{ name: '100 ' + u, grams: 100 }, { name: '1 tbsp', grams: 15 }, { name: '1 tsp', grams: 5 }];
+}
+function dedupeServings(arr) {
+  const out = [], seen = new Set();
+  for (const s of (arr || [])) {
+    if (!s || !s.name || !(s.grams > 0)) continue;
+    const k = Math.round(s.grams * 100) / 100;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push({ name: String(s.name), grams: Number(s.grams) });
+  }
+  return out;
+}
+function withStandardServings(servings, per) {
+  return dedupeServings((servings || []).concat(standardServings(per)));
+}
+
 function emptyFood(cat) {
   return { id: null, name: '', emoji: '\uD83C\uDF7D\uFE0F', cats: [cat || 'misc'], per: 'g', n: {}, servings: [], promptAdd: [], src: 'custom', uses: 0, lastUsed: 0 };
 }
@@ -612,8 +673,10 @@ function openFoodEditor(existing, presetCat) {
   const perSel = el('select', null, [el('option', { value: 'g' }, 'grams (g)'), el('option', { value: 'ml' }, 'millilitres (ml)')]);
   perSel.value = food.per || 'g';
 
-  /* servings editor */
-  let servs = (food.servings || []).map(s => ({ name: s.name, grams: s.grams }));
+  /* servings editor (new foods start with standard handy servings) */
+  let servs = (food.servings && food.servings.length)
+    ? food.servings.map(s => ({ name: s.name, grams: s.grams }))
+    : standardServings(food.per || 'g');
   const servBox = el('div');
   function drawServs() {
     clear(servBox);
@@ -630,13 +693,46 @@ function openFoodEditor(existing, presetCat) {
   }
   drawServs();
 
-  /* nutrient grid */
+  /* nutrient grid. Nutrients with an NRV get a unit toggle so you can enter the
+     label's "%NRV" instead of hunting for the mg/µg amount. */
   const nInputs = {};
+  const pctMode = {};
   const grid = el('div', { class: 'nutr-grid' });
+  const perUnit = () => (perSel.value === 'ml' ? 'ml' : 'g');
   NUTR.forEach(nt => {
     const inp = numInput({ value: (food.n[nt.k] != null ? food.n[nt.k] : ''), step: 'any', min: '0', placeholder: nt.unit });
     nInputs[nt.k] = inp;
-    grid.appendChild(el('div', { class: 'nf' }, field(nt.label + ' (' + nt.unit + ')', inp)));
+    if (NRV[nt.k] != null) {
+      pctMode[nt.k] = false;
+      const conv = el('div', { class: 'hint' });
+      const tgl = el('button', { class: 'unitbtn', type: 'button' }, nt.unit);
+      function refresh() {
+        const v = parseNum(inp.value, null);
+        if (pctMode[nt.k]) {
+          inp.placeholder = '% NRV';
+          conv.textContent = (v != null)
+            ? ('= ' + (Math.round(v / 100 * NRV[nt.k] * 1000) / 1000) + ' ' + nt.unit + ' / 100' + perUnit())
+            : ('100% NRV = ' + NRV[nt.k] + ' ' + nt.unit);
+        } else {
+          inp.placeholder = nt.unit;
+          conv.textContent = '';
+        }
+      }
+      tgl.addEventListener('click', () => {
+        pctMode[nt.k] = !pctMode[nt.k];
+        tgl.textContent = pctMode[nt.k] ? '% NRV' : nt.unit;
+        tgl.classList.toggle('on', pctMode[nt.k]);
+        refresh();
+      });
+      inp.addEventListener('input', refresh);
+      grid.appendChild(el('div', { class: 'nf' }, [
+        el('label', { class: 'fieldlbl' }, nt.label),
+        el('div', { class: 'unitrow' }, [inp, tgl]),
+        conv,
+      ]));
+    } else {
+      grid.appendChild(el('div', { class: 'nf' }, field(nt.label + ' (' + nt.unit + ')', inp)));
+    }
   });
 
   function save() {
@@ -648,7 +744,11 @@ function openFoodEditor(existing, presetCat) {
     const n = {};
     for (const nt of NUTR) {
       const raw = nInputs[nt.k].value;
-      if (raw !== '' && raw != null) { const v = Number(raw); if (Number.isFinite(v) && v >= 0) n[nt.k] = v; }
+      if (raw === '' || raw == null) continue;
+      let v = Number(raw);
+      if (!Number.isFinite(v) || v < 0) continue;
+      if (NRV[nt.k] != null && pctMode[nt.k]) v = v / 100 * NRV[nt.k]; /* %NRV -> amount */
+      n[nt.k] = Math.round(v * 1000) / 1000;
     }
     const out = {
       id: food.id || uid('f_'),
@@ -843,8 +943,9 @@ function openImport() {
     ]));
     if (res.errors.length) preview.appendChild(el('div', { class: 'hint' }, res.errors.join(' ')));
     preview.appendChild(el('button', { class: 'btn', style: { marginTop: '10px' }, onClick: () => {
-      const out = canonicalizeFood({ id: uid('f_'), name: f.name, emoji: f.emoji, cats: f.cats, per: f.per, n: f.n,
-        servings: f.servings.length ? f.servings : [], src: 'import', uses: 0, lastUsed: 0 });
+      const importPer = /ml/i.test(f.per || '') ? 'ml' : 'g';
+      const out = canonicalizeFood({ id: uid('f_'), name: f.name, emoji: f.emoji, cats: f.cats, per: importPer, n: f.n,
+        servings: withStandardServings(f.servings, importPer), src: 'import', uses: 0, lastUsed: 0 });
       (async () => { await saveFood(out); closeSheet(); toast('Imported \u201C' + f.name + '\u201D \u2014 long-press it any time to edit'); await rerender(); })();
     } }, 'Save imported food'));
   }
@@ -887,24 +988,42 @@ function mapOff(nutriments) {
    classic cgi search as a fallback. */
 /* country name -> Open Food Facts tag, e.g. "United Kingdom" -> "en:united-kingdom" */
 function countryTag(name) { return 'en:' + String(name).toLowerCase().replace(/\s+/g, '-'); }
+/* Make a query forgiving: drop case, apostrophes and punctuation, collapse spaces.
+   So "Brennan's", "brennans" and "BRENNANS" all become the same thing. */
+function normalizeQuery(q) {
+  return String(q || '')
+    .toLowerCase()
+    .replace(/[\u2019'`]+/g, '')      /* apostrophes vanish: "brennan's" -> "brennans" */
+    .replace(/[^a-z0-9]+/g, ' ')      /* any other punctuation -> space */
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 /* OFF brand search, optionally restricted to one or more countries.
-   countries: array of country names (e.g. ['United Kingdom','Ireland']) or empty for worldwide. */
+   countries: array of country names (e.g. ['Ireland','Italy']) or empty for worldwide. */
 async function offQuery(q, countries) {
-  const fields = 'product_name,brands,nutriments';
+  const fields = 'product_name,brands,nutriments,serving_size,serving_quantity';
   const list = countries || [];
-  /* Search-a-licious: combine free text with a country filter clause in q */
-  let qExpr = q;
-  if (list.length) qExpr = q + ' (' + list.map(c => 'countries_tags:' + countryTag(c)).join(' OR ') + ')';
-  try {
-    const r = await fetch('https://search.openfoodfacts.org/search?q=' + encodeURIComponent(qExpr) +
-      '&page_size=20&fields=' + fields);
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    const data = await r.json();
-    const hits = data.hits || data.products || [];
-    if (hits.length) return hits;
-  } catch (e) { /* fall through to legacy endpoint */ }
-  /* Legacy cgi search: supports full text + a single country tag filter only */
-  let url2 = 'https://world.openfoodfacts.org/cgi/search.pl?search_terms=' + encodeURIComponent(q) +
+  const norm = normalizeQuery(q);
+  const terms = norm.split(' ').filter(Boolean);
+  const countryClause = list.length ? ' (' + list.map(c => 'countries_tags:' + countryTag(c)).join(' OR ') + ')' : '';
+  async function sl(textExpr) {
+    /* group the text so the country filter ANDs with it rather than leaking into the OR */
+    const expr = countryClause ? '(' + textExpr + ')' + countryClause : textExpr;
+    try {
+      const r = await fetch('https://search.openfoodfacts.org/search?q=' + encodeURIComponent(expr) +
+        '&page_size=20&fields=' + fields);
+      if (!r.ok) return [];
+      const data = await r.json();
+      return data.hits || data.products || [];
+    } catch (e) { return []; }
+  }
+  /* pass 1: all the words; pass 2: loosen to OR so an extra/garbled word
+     (e.g. "superbread") doesn't wipe out a known brand match ("brennans"). */
+  let hits = await sl(norm);
+  if (!hits.length && terms.length > 1) hits = await sl(terms.join(' OR '));
+  if (hits.length) return hits;
+  /* legacy cgi search: most lenient substring matching, normalized terms */
+  let url2 = 'https://world.openfoodfacts.org/cgi/search.pl?search_terms=' + encodeURIComponent(norm) +
     '&search_simple=1&action=process&json=1&page_size=20&fields=' + fields;
   if (list.length === 1) url2 += '&tagtype_0=countries&tag_contains_0=contains&tag_0=' + encodeURIComponent(list[0]);
   const r2 = await fetch(url2);
@@ -1009,9 +1128,9 @@ function openOffSearch(cat) {
   scopeSel.addEventListener('change', () => { scope = scopeSel.value; saveMeta('offScope', scope); if (source === 'off') run(); });
   regionRow.append(el('label', { class: 'fieldlbl' }, 'Region'), scopeSel);
 
-  function addFood(name, n, brand) {
+  function addFood(name, n, servings) {
     const food = canonicalizeFood({ id: uid('f_'), name: name, emoji: '\uD83C\uDF7D\uFE0F',
-      cats: [cat || 'misc'], per: 'g', n: n, servings: [{ name: '100 g', grams: 100 }],
+      cats: [cat || 'misc'], per: 'g', n: n, servings: withStandardServings(servings || [], 'g'),
       src: source === 'usda' ? 'usda' : 'off', uses: 0, lastUsed: 0 });
     (async () => { await saveFood(food); toast('Added \u2014 long-press to edit categories or servings'); await rerender(); openServingSheet(food); })();
   }
@@ -1027,7 +1146,10 @@ function openOffSearch(cat) {
         rows.forEach(f => {
           const n = mapFdc(f.foodNutrients);
           const tag = (f.dataType || '').replace('Survey (FNDDS)', 'survey');
-          results.appendChild(el('div', { class: 'servopt', onClick: () => addFood(titleCase(f.description), n, '') }, [
+          const sv = [];
+          const ss = Number(f.servingSize), su = String(f.servingSizeUnit || '').toLowerCase();
+          if (Number.isFinite(ss) && ss > 0 && (su === 'g' || su === 'ml')) sv.push({ name: f.householdServingFullText || '1 serving', grams: Math.round(ss) });
+          results.appendChild(el('div', { class: 'servopt', onClick: () => addFood(titleCase(f.description), n, sv) }, [
             el('span', null, titleCase(f.description)),
             el('span', { class: 'g' }, (n.kcal != null ? n.kcal + ' kcal/100g' : '') + (tag ? '  \u00b7 ' + tag.toLowerCase() : '')),
           ]));
@@ -1039,7 +1161,10 @@ function openOffSearch(cat) {
         prods.forEach(p => {
           const nm = p.product_name + (p.brands ? (' \u00b7 ' + String(p.brands).split(',')[0]) : '');
           const n = mapOff(p.nutriments);
-          results.appendChild(el('div', { class: 'servopt', onClick: () => addFood(p.product_name, n, p.brands) }, [
+          const sv = [];
+          const sq = Number(p.serving_quantity);
+          if (Number.isFinite(sq) && sq > 0) sv.push({ name: (p.serving_size && String(p.serving_size).trim()) || '1 serving', grams: Math.round(sq) });
+          results.appendChild(el('div', { class: 'servopt', onClick: () => addFood(p.product_name, n, sv) }, [
             el('span', null, nm),
             el('span', { class: 'g' }, (p.nutriments['energy-kcal_100g'] != null ? Math.round(p.nutriments['energy-kcal_100g']) + ' kcal/100g' : '')),
           ]));

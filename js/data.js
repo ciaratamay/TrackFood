@@ -267,3 +267,13 @@ const EMOJI_LIB = (
   '🥛 🧀 🍦 🍨 🍧 🍮 🥤 🧋 🍼 ' +
   '🍪 🍩 🍰 🎂 🧁 🍫 🍬 🍭 🍡 🍯 🥜 🌰 🍿 🧂 🥫 🍶 🫙 💊 🧃 ☕ 🫖 🧉 🥧'
 ).split(' ').filter(Boolean);
+
+/* EU Nutrient Reference Values (Reg. 1169/2011, Annex XIII), in each nutrient's
+   stored unit. Used to let people enter a label's "%NRV" and convert to an amount.
+   Only nutrients with an official NRV are listed; macros/energy have none here. */
+const NRV = {
+  c: 80, iron: 14, calcium: 800, magnesium: 375, zinc: 10, potassium: 2000,
+  phosphorus: 700, copper: 1, manganese: 2, selenium: 55, iodine: 150,
+  vita: 800, d: 5, e: 12, vitk: 75,
+  b1: 1.1, b2: 1.4, b3: 16, b5: 6, b6: 1.4, b9: 200, b12: 2.5,
+};
